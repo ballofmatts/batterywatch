@@ -173,23 +173,24 @@ def hid_descriptor(usage_page=0xFF43):
     page_item = bytes([0x05, usage_page]) if usage_page <= 0xFF else bytes([0x06, usage_page & 0xFF, (usage_page >> 8) & 0xFF])
     return page_item + bytes([0x0A, 0x02, 0x02]) + b"\xC0"
 
-def install_g733_scenario(iface=3, usage_page=0xFF43):
+def install_g733_scenario(iface=3, usage_page=0xFF43, with_blocked=False):
     # Logitech HID++ headset: battery node on usage page 0xff43 (iface is now
     # irrelevant to matching - only the report descriptor page decides), request
-    # 11 ff 08 0a, 0x10 reply
+    # 11 ff 08 0a, long 0x11 reply (the only report this family's descriptor
+    # declares)
     scenario["uevents"] = {
         "hidraw8": ("DRIVER=hid-generic\nHID_ID=0003:0000046D:00000AB5\n"
                     "HID_NAME=Logitech G733 LIGHTSPEED\n"
                     f"HID_PHYS=usb-0000:00:14.0-11/input{iface}\nHID_UNIQ=\n"),
     }
     scenario["fake_devs"] = {"/dev/hidraw8": 208}
-    scenario["deny"] = False
+    scenario["deny"] = with_blocked
     scenario["writes"] = []
     scenario["write_data"] = []
     scenario["reads"] = []
     scenario["read_sizes"] = []
     scenario["open_flags"] = []
-    scenario["reply_buf"] = bytearray(8)
+    scenario["reply_buf"] = bytearray(0)
     scenario["reply_queue"] = []
     scenario["reply_fd"] = 208
     scenario["descriptors"] = {"hidraw8": hid_descriptor(usage_page)} if usage_page is not None else {}
@@ -697,49 +698,193 @@ def test_simulate_both_report_after_both_rules():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Logitech headset (G733): voltage read
+# Logitech headset (G733): HID++ request + voltage read
+#
+# SYNTHETIC PROTOCOL FIXTURES - no Logitech battery reply has ever been
+# captured. The issue #2 log holds the G733's report descriptor, which proves
+# the battery node declares the long report 0x11 (85 11, 19 bytes), but no
+# captured reply bytes. The frames below are therefore built from the
+# documented HID++ 2.0 frame layout (Logitech/cpg-docs hidpp20 tables, Solaar
+# hidpp20) rather than from a recording:
+#   [0] report id (0x11 long = 20 bytes - the only one this family declares)
+#   [1] device address   [2] feature index   [3] function/software id
+#   [4..5] voltage (big endian)   [6] charge state (0x01 discharging, 0x03 charging)
+#   error reply: feature index 0xff + echoed feature/function + code at byte 5
 # ══════════════════════════════════════════════════════════════════════════
+def g733_frame(report_id=0x11, device=0xFF, feature=0x08, func=0x0A,
+               voltage_mv=0, state=0x01, error=None, length=None):
+    if error is not None:
+        frame = bytes([report_id, device, 0xFF, feature, func, error])
+    else:
+        frame = bytes([report_id, device, feature, func,
+                       (voltage_mv >> 8) & 0xFF, voltage_mv & 0xFF, state])
+    return bytearray(frame.ljust(length if length is not None
+                                 else (20 if report_id == 0x11 else 7), b"\x00"))
+
+def set_g733_reply(*args, **kwargs):
+    scenario["reply_buf"] = g733_frame(*args, **kwargs)
+
+def g733_reads(report_id=0x11, **kwargs):
+    """Runs one read against a standing single-frame reply."""
+    install_g733_scenario()
+    set_g733_reply(report_id=report_id, **kwargs)
+    return rhd.read_status(rhd.find_devices()[0])
+
 def test_voltage_percentage_curve():
     assert rhd._voltage_percentage(4100, rhd.G633_CURVE) == 100
     assert rhd._voltage_percentage(4050, rhd.G633_CURVE) == 93   # 80 + 20 * 100/150 between 3950-4100
     assert rhd._voltage_percentage(3150, rhd.G633_CURVE) == 0
     assert rhd._voltage_percentage(3000, rhd.G633_CURVE) == 0    # below curve floor -> clamp to 0
 
-def g733_frame(status=0x01, voltage_mv=4000, state=0x03):
-    buf = bytearray(8)
-    buf[0] = 0x10
-    buf[1] = 0xFF
-    buf[2] = status
-    buf[3] = 0x00
-    buf[4] = (voltage_mv >> 8) & 0xFF
-    buf[5] = voltage_mv & 0xFF
-    buf[6] = state
-    return buf
+def test_logitech_long_reply_produces_battery_reading():
+    # the G733's descriptor declares only the long report 0x11 (issue #2)
+    assert g733_reads(report_id=0x11, voltage_mv=4050, state=0x01) == {"percentage": 93, "charging": False}
 
-def set_g733_reply(status=0x01, voltage_mv=4000, state=0x03):
-    scenario["reply_buf"] = g733_frame(status, voltage_mv, state)
+def test_logitech_short_reply_is_not_accepted():
+    # HID++ 1.0 shape: this family is HID++ 2.0 and its descriptor declares no
+    # 0x10 report, so a 0x10 packet must never be read as a battery reply
+    assert g733_reads(report_id=0x10, voltage_mv=4050, state=0x01) is None
 
-def test_logitech_voltage_parse_basic():
+def test_logitech_long_reply_charging():
+    assert g733_reads(report_id=0x11, voltage_mv=4100, state=0x03) == {"percentage": 100, "charging": True}
+
+def test_logitech_request_is_unchanged():
     install_g733_scenario()
-    set_g733_reply(status=0x01, voltage_mv=4050, state=0x01)
-    assert rhd.find_devices()[0].desc.name == "Logitech G733/G933/G935"
+    gdev = rhd.find_devices()[0]
+    assert gdev.desc.source.request == bytes([0x11, 0xFF, 0x08, 0x0A]) + b"\x00" * 16, "20-byte long request"
+    set_g733_reply(report_id=0x11, voltage_mv=4050, state=0x01)
+    rhd.read_status(gdev)
+    assert scenario["write_data"] == [bytes([0x11, 0xFF, 0x08, 0x0A]) + b"\x00" * 16], \
+        f"request sent to the device: {scenario['write_data']!r}"
+
+def test_logitech_profile_waits_for_the_long_report_only():
+    install_g733_scenario()
+    schema = rhd.find_devices()[0].source
+    assert rhd.needed_reports(schema) == {0x11: 7}, "7 bytes through the charge state"
+    assert schema.charge == rhd.DataPos(0x11, 4) and schema.charge_range is None
+    assert not hasattr(rhd, "accepted_ids") and not hasattr(rhd, "reply_complete"), \
+        "no alternative-reply machinery left: one report ID per schema"
+    assert not hasattr(schema, "valid"), "rejection_reason() is the single validity check"
+
+def test_logitech_ignores_unrelated_packets_until_the_matching_reply():
+    install_g733_scenario()
+    scenario["reply_buf"] = bytearray(0)
+    scenario["reply_queue"] = [
+        bytearray(8),                          # a HID++ event on the same node
+        g733_frame(report_id=0x11, feature=0x04, voltage_mv=4050),   # other feature
+        g733_frame(report_id=0x11, func=0x15, voltage_mv=4050),      # other function
+        g733_frame(report_id=0x11, device=0x00, voltage_mv=4050),    # no device addressed
+        g733_frame(report_id=0x11, voltage_mv=0xFFFF),                # implausible voltage
+        g733_frame(report_id=0x11, voltage_mv=4050, state=0x01),      # the real reply
+    ]
     assert rhd.read_status(rhd.find_devices()[0]) == {"percentage": 93, "charging": False}
+    assert len(scenario["reads"]) == 6, f"every queued packet was read: {len(scenario['reads'])}"
 
-def test_logitech_voltage_parse_charging():
+def test_logitech_other_report_ids_are_not_battery_frames():
     install_g733_scenario()
-    set_g733_reply(status=0x01, voltage_mv=4100, state=0x03)
-    assert rhd.read_status(rhd.find_devices()[0]) == {"percentage": 100, "charging": True}
-
-def test_logitech_voltage_parse_off_returns_none():
-    install_g733_scenario()
-    set_g733_reply(status=0xFF, voltage_mv=4100, state=0x03)
+    scenario["reply_buf"] = bytearray(0)
+    scenario["reply_queue"] = [g733_frame(report_id=0x01, voltage_mv=4050)]
     assert rhd.read_status(rhd.find_devices()[0]) is None
 
-def test_logitech_voltage_parse_low_voltage_returns_none():
+def test_logitech_rejects_wrong_address_feature_and_function():
+    install_g733_scenario()
+    check = rhd.find_devices()[0].source.rejection_reason
+    assert check(g733_frame(report_id=0x11, device=0x00, voltage_mv=4050)), "0x00 addresses no device"
+    assert check(g733_frame(report_id=0x11, feature=0x04, voltage_mv=4050)), "other feature"
+    assert check(g733_frame(report_id=0x11, func=0x15, voltage_mv=4050)), "other function"
+    assert check(g733_frame(report_id=0x11, voltage_mv=4050)) is None, "the battery reply itself"
+
+def test_logitech_accepts_addressed_index_and_other_software_id():
+    # 0xff is the corded/receiver address this helper sends; a receiver index is
+    # a valid address too, and the software-ID nibble of the function byte is
+    # echoed by some firmware and not by others, so it must not decide a match
+    install_g733_scenario()
+    check = rhd.find_devices()[0].source.rejection_reason
+    assert check(g733_frame(report_id=0x11, device=0x01, voltage_mv=4050)) is None
+    assert check(g733_frame(report_id=0x11, func=0x0B, voltage_mv=4050)) is None
+
+def test_logitech_truncated_packets_never_crash_or_decode():
+    install_g733_scenario()
+    check = rhd.find_devices()[0].source.rejection_reason
+    reply = g733_frame(report_id=0x11, voltage_mv=4050)
+    for length in range(0, 7):
+        reason = check(reply[:length])
+        assert reason, f"{length}-byte packet must be rejected with a reason"
+
+    scenario["reply_buf"] = bytearray(0)
+    scenario["reply_queue"] = [reply[:n] for n in (1, 2, 3, 5, 6)]
+    assert rhd.read_status(rhd.find_devices()[0]) is None, "truncated packets produce no reading"
+
+def test_logitech_validator_checks_the_report_id_itself():
+    # the read loop filters report IDs too, but the validator must reject a
+    # short 0x10 frame on its own too - issue #47's report id is 0x11
+    install_g733_scenario()
+    check = rhd.find_devices()[0].source.rejection_reason
+    reason = check(g733_frame(report_id=0x10, voltage_mv=4050))
+    assert reason and "0x10" in reason and "0x11" in reason, reason
+    assert check(g733_frame(report_id=0x11, voltage_mv=4050)) is None
+
+def test_logitech_gpro_series_accepts_issue_47_software_id_echo():
+    # issue #47: a PRO X Wireless (0x0aba) answers the same feature 0x06 request
+    # with function/software-ID byte 0x00 where the G PRO profile sends 0x0d.
+    # Only the function (high nibble) decides a match, so that reply reads.
+    install_g733_scenario()
+    gpro = next(d for d in rhd.KNOWN_DEVICES if d.name == "Logitech G PRO Series")
+    check, parse = gpro.source.rejection_reason, gpro.parse
+    assert 0x0ABA in [v.pid for v in gpro.variants], "the PRO X Wireless keeps its profile"
+    assert gpro.source.request[:4] == bytes([0x11, 0xFF, 0x06, 0x0D])
+    for fnsw in (0x00, 0x0D):
+        reply = bytes([0x11, 0xFF, 0x06, fnsw, 0x0F, 0xD2, 0x01]).ljust(20, b"\x00")
+        assert check(reply) is None, f"function byte {fnsw:#04x} must be accepted"
+        assert parse({0x11: bytearray(reply)}) == {"percentage": 84, "charging": False}
+
+def test_logitech_error_reply_is_recorded_and_never_a_voltage():
+    # the error frame's bytes 4-5 are the echoed feature/function: 0x080a looks
+    # like a 2058 mV battery if an error frame were decoded as a reading
+    assert g733_reads(report_id=0x11, error=0x08) is None, "error reply produces no reading"
+    install_g733_scenario()
+    check = rhd.find_devices()[0].source.rejection_reason
+    reason = check(g733_frame(report_id=0x11, error=0x08))
+    assert "error reply" in reason and "Busy" in reason, reason
+    reason = check(g733_frame(report_id=0x11, error=0x06))
+    assert "INVALID_FEATURE_INDEX" in reason, reason
+
+def test_logitech_distinguishes_error_frame_from_headset_offline():
+    # byte 2 = 0xff means both "HID++ 2.0 error" and "headset not connected"
+    # (HeadsetControl). An error frame echoes the request's feature/function -
+    # the kernel's own hidpp_match_error rule - the offline marker does not.
+    install_g733_scenario()
+    check = rhd.find_devices()[0].source.rejection_reason
+    reason = check(g733_frame(report_id=0x11, error=0x08))
+    assert "error reply answering our request" in reason, reason
+    offline = check(g733_frame(report_id=0x11, feature=0x04, error=0x01))
+    assert "headset-offline marker" in offline, offline
+    assert "Busy" not in offline, "an offline marker carries no error code to report"
+
+def test_logitech_error_reply_keeps_waiting_then_reports_nothing():
+    install_g733_scenario()
+    scenario["reply_buf"] = bytearray(0)
+    scenario["reply_queue"] = [
+        g733_frame(report_id=0x11, error=0x08),                  # busy
+        g733_frame(report_id=0x11, voltage_mv=4050, state=0x01),  # then the real reply
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {"percentage": 93, "charging": False}
+    assert len(scenario["reads"]) == 2, "the error frame did not end the read"
+
+def test_logitech_g733_offline_produces_no_entry():
+    # a headset that is off (or an empty receiver slot) answers with the 0xff
+    # feature byte instead of a voltage; neither reading case is a battery
+    install_g733_scenario()
+    set_g733_reply(report_id=0x11, feature=0x04, error=0x01)   # offline marker
+    assert rhd._device_entry(rhd.find_devices()[0]) is None
+    set_g733_reply(report_id=0x11, error=0x01)                 # error frame
+    assert rhd._device_entry(rhd.find_devices()[0]) is None
+
+def test_logitech_voltage_parse_low_voltage_keeps_reading():
     # a below-curve voltage is not the battery frame: keep waiting, then time out
     install_g733_scenario()
     scenario["reply_buf"] = bytearray(0)
-    scenario["reply_queue"] = [g733_frame(status=0x01, voltage_mv=3100, state=0x01)]
+    scenario["reply_queue"] = [g733_frame(report_id=0x11, voltage_mv=3100, state=0x01)]
     assert rhd.read_status(rhd.find_devices()[0]) is None
 
 def test_logitech_bad_frame_then_good_frame_keeps_reading():
@@ -748,8 +893,8 @@ def test_logitech_bad_frame_then_good_frame_keeps_reading():
     install_g733_scenario()
     scenario["reply_buf"] = bytearray(0)
     scenario["reply_queue"] = [
-        g733_frame(status=0x01, voltage_mv=0xFFFF, state=0x01),   # garbage frame
-        g733_frame(status=0x01, voltage_mv=4050, state=0x01),     # real reply
+        g733_frame(report_id=0x11, voltage_mv=0xFFFF, state=0x01),   # garbage frame
+        g733_frame(report_id=0x11, voltage_mv=4050, state=0x01),     # real reply
     ]
     assert rhd.read_status(rhd.find_devices()[0]) == {"percentage": 93, "charging": False}
 
@@ -758,16 +903,9 @@ def test_logitech_g733_match_and_udev_rule():
     sdev = rhd.find_devices()[0]
     assert sdev.desc.name == "Logitech G733/G933/G935"
     assert sdev.pid == 0x0AB5
-    assert sdev.desc.source.request == bytes([0x11, 0xFF, 0x08, 0x0A]) + b"\x00" * 16, "20-byte long request"
     rule = rhd.udev_rule_for(sdev.desc.vid)
     assert 'MODE="0660"' in rule, "headset needs write access to answer the request"
     assert "SYMLINK" not in rule
-
-def test_logitech_g733_offline_produces_no_entry():
-    # when the headset is off, replies are status 0xff and must be skipped
-    install_g733_scenario()
-    set_g733_reply(status=0xFF, voltage_mv=0, state=0x03)
-    assert rhd._device_entry(rhd.find_devices()[0]) is None
 
 def test_logitech_headset_families():
     headsets = {d.name: d for d in rhd.KNOWN_DEVICES if d.device_type == rhd.DeviceType.HEADSET}
@@ -776,6 +914,9 @@ def test_logitech_headset_families():
         assert all(v.iface == 3 or v.usage_page == 0xFF43 for v in d.variants), \
             f"{d.name}: battery node pinned by interface 3 or vendor usage page"
         assert d.source.request == bytes([0x11, 0xFF, d.source.request[2], d.source.request[3]]) + b"\x00" * 16, f"{d.name}: 20-byte long request"
+        # HID++ 2.0 throughout: long request in, long reply out
+        assert rhd.needed_reports(d.source) == {0x11: 7}, f"{d.name}: long reply 0x11 only"
+        assert d.source.validate_reply is not None, f"{d.name}: reply is validated against the request"
         assert d.parse is not None
     assert [v.pid for v in headsets["Logitech G733/G933/G935"].variants] == [0x0A5B, 0x0A87, 0x0AB5, 0x0AFE, 0x0B1F]
     # G PRO family drops the X2 (0x0AFB/0x0AFC): Solaar lists the X2 as 0x0AF7
@@ -824,7 +965,7 @@ def test_discovery_picks_battery_node_among_multiple_interfaces():
         "HID_PHYS=usb-0000:00:14.0-11/input2\nHID_UNIQ=\n")
     scenario["descriptors"]["hidraw9"] = bytes([0x05, 0x0C]) + b"\xC0"  # consumer page, no 0xff43
     scenario["fake_devs"]["/dev/hidraw9"] = 209
-    set_g733_reply(status=0x01, voltage_mv=4050, state=0x01)  # battery reply on the battery node
+    set_g733_reply(report_id=0x11, voltage_mv=4050, state=0x01)  # battery reply on the battery node
     devs = rhd.find_devices()
     assert [d.devpath for d in devs] == ["/dev/hidraw8"], f"found: {[d.devpath for d in devs]!r}"
     assert rhd.read_status(devs[0]) == {"percentage": 93, "charging": False}
@@ -857,26 +998,86 @@ def test_sc2_stream_read():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# --debug diagnostics (stderr only; stdout stays the JSON the widget reads)
+# ══════════════════════════════════════════════════════════════════════════
+@contextlib.contextmanager
+def debug_stderr():
+    saved = rhd._DEBUG
+    rhd._DEBUG = True
+    stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(stderr):
+            yield stderr
+    finally:
+        rhd._DEBUG = saved
+
+def test_debug_output_explains_an_unanswered_request():
+    # the finding that issue #2 needed: which node, which request, what came
+    # back, why it was rejected, and that the read then timed out
+    install_g733_scenario()
+    scenario["reply_buf"] = bytearray(0)
+    scenario["reply_queue"] = [g733_frame(report_id=0x11, feature=0x04, voltage_mv=4050)]
+    with debug_stderr() as stderr:
+        devs = rhd.find_devices()
+        assert rhd._device_entry(devs[0]) is None
+    log = stderr.getvalue()
+    assert all(line.startswith("[batterywatch] ") for line in log.splitlines() if line), log
+    assert "/dev/hidraw8" in log and "Logitech G733/G933/G935" in log, "device identity + node"
+    assert "046d:0ab5" in log and "iface 3" in log, "identity + selected interface"
+    assert "write 11 ff 08 0a 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00" in log, "request bytes"
+    assert "received 11 ff 04 0a 0f d2 01" in log, "received packet bytes"
+    assert "feature index 0x04 is not 0x08" in log, "rejection reason"
+    assert "no accepted reply (report 0x11) within 1s" in log, "timeout"
+
+def test_debug_output_records_error_reply_details():
+    install_g733_scenario()
+    scenario["reply_queue"] = [g733_frame(report_id=0x11, error=0x08)]
+    with debug_stderr() as stderr:
+        assert rhd._device_entry(rhd.find_devices()[0]) is None
+    log = stderr.getvalue()
+    assert "HID++ 2.0 error reply answering our request: code 8 (Busy)" in log, log
+    assert "entry dropped" in log, log
+
+def test_debug_output_records_open_and_write_failures():
+    install_g733_scenario(with_blocked=True)
+    with debug_stderr() as stderr:
+        assert rhd.read_status(rhd.find_devices()[0]) is None
+    assert "open(/dev/hidraw8, O_RDWR) failed: [Errno 13] Permission denied" in stderr.getvalue()
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # Helper as a subprocess (real run, no device)
 # ══════════════════════════════════════════════════════════════════════════
 def test_helper_compiles():
     assert py_compile.compile(HELPER, doraise=True) is not None
 
-def test_helper_real_run_emits_valid_json():
-    # subprocess needs the REAL os.read/write/close/listdir and select.poll - the
-    # scenario monkey-patches live on the shared os/select modules and would corrupt
-    # pipe I/O, so restore them around this real-world run, then re-patch.
+@contextlib.contextmanager
+def real_os():
+    # A subprocess needs the REAL os.read/write/close/listdir and select.poll -
+    # the scenario monkey-patches live on the shared os/select modules and would
+    # corrupt pipe I/O, so restore them around the run, then re-patch.
     os.open, os.write, os.read, os.close = real_osopen, real_oswrite, real_osread, real_osclose
     os.listdir = real_listdir
     select.poll = real_poll
     try:
-        r = subprocess.run([sys.executable, HELPER], capture_output=True, text=True,
-                           cwd=os.path.dirname(HELPER), timeout=30)
+        yield
     finally:
         patch_module()
+
+def test_helper_real_run_emits_valid_json():
+    with real_os():
+        r = subprocess.run([sys.executable, HELPER], capture_output=True, text=True,
+                           cwd=os.path.dirname(HELPER), timeout=30)
     assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr!r}"
     parsed = json.loads(r.stdout.strip())
     assert isinstance(parsed, list), f"stdout={r.stdout.strip()!r}"
+
+def test_debug_flag_keeps_stdout_valid_json():
+    with real_os():
+        r = subprocess.run([sys.executable, HELPER, "--debug", "--simulate"], capture_output=True,
+                           text=True, cwd=os.path.dirname(HELPER), timeout=30)
+    assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr!r}"
+    assert isinstance(json.loads(r.stdout.strip()), list), f"stdout={r.stdout.strip()!r}"
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+- **G733 battery not reported** — the Logitech G733/G933/G935 battery read waited only for a HID++ 1.0-style short reply (`0x10`), but these are HID++ 2.0 headsets whose battery node declares and answers on the long report `0x11` only, so every read timed out and the device was dropped. The reply is now validated (device address, feature index, function, minimum length) and a HID++ 2.0 error frame is reported — with its code — instead of being decoded as a bogus voltage
+- **Debug output for troubleshooting** — `--debug` now logs the selected node and identity, the exact request bytes, every received packet with the reason it was rejected, and timeouts, on stderr only (stdout stays valid JSON)
+
 ## [0.3.2] - 2026-08-22
 
 ### Added
