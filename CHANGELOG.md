@@ -19,8 +19,9 @@
 
 ### Contributors
 - @MrAdrianPl — reverse-engineered the Keychron M5 battery protocol (hid report probing)
-- StarPepe — on-device testing and verification of the M5 support
+- @StarPepe — on-device testing and verification of the M5 support
 - @LookforFPS — ROG Azoth battery support (wired USB, 2.4 GHz dongle and OMNI receiver), reverse-engineered on hardware
+- @CorneliusKluge — issue #2 on-device diagnostics: the hidraw report descriptor that identified the G733's long-report response as the cause of the missing battery reading
 
 ## [0.3.1] - 2026-07-01
 

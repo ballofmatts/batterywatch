@@ -27,6 +27,8 @@ zip -r "$OUTPUT_DIR/$PLASMOID_NAME" . \
     -x "dist/*" \
     -x ".git/*" \
     -x ".gitignore" \
+    -x ".claude/*" \
+    -x ".github/*" \
     -x ".future-tasks/*"
 
 if [ $? -eq 0 ]; then
