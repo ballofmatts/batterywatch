@@ -11,7 +11,7 @@ Item {
     id: root
     visible: false
 
-    // gdbus, not qdbus (Qt6 renamed it to qdbus6); org.razer is on the session bus
+    // org.razer is on the session bus
     readonly property string getDeviceListCmd: "gdbus call --session --dest org.razer --object-path /org/razer --method razer.devices.getDevices"
 
     property bool daemonUnavailable: false
@@ -60,62 +60,6 @@ Item {
     // ═══════════════════════════════════════════════════════════════════════
     // HELPER FUNCTIONS
     // ═══════════════════════════════════════════════════════════════════════
-
-    // gdbus returns a GVariant tuple: (value,)
-    function unwrapVariant(stdout) {
-        const raw = (stdout || "").trim();
-        const tuple = raw.match(/^\(([\s\S]*),\s*\)$/);
-        if (tuple)
-            return tuple[1];
-        const bare = raw.match(/^\(([\s\S]*)\)$/);
-        return bare ? bare[1] : raw;
-    }
-
-    // strings switch to double quotes when they contain an apostrophe
-    function scanStrings(text) {
-        const values = [];
-        let quote = null;
-        let value = "";
-        for (let i = 0; i < text.length; i++) {
-            const c = text[i];
-            if (quote === null) {
-                if (c === "'" || c === '"') {
-                    quote = c;
-                    value = "";
-                }
-                continue;
-            }
-            if (c === "\\") {
-                value += text[++i] || "";
-                continue;
-            }
-            if (c === quote) {
-                values.push(value);
-                quote = null;
-                continue;
-            }
-            value += c;
-        }
-        return values;
-    }
-
-    function parseString(stdout) {
-        const values = scanStrings(unwrapVariant(stdout));
-        return values.length > 0 ? values[0] : unwrapVariant(stdout).trim();
-    }
-
-    function parseNumber(stdout) {
-        const value = parseFloat(unwrapVariant(stdout));
-        return isNaN(value) ? undefined : value;
-    }
-
-    function parseBool(stdout) {
-        return unwrapVariant(stdout).trim() === "true";
-    }
-
-    function parseDeviceList(stdout) {
-        return scanStrings(unwrapVariant(stdout));
-    }
 
     function deviceCmd(id, method) {
         return `gdbus call --session --dest org.razer --object-path /org/razer/device/${id} --method razer.device.${method}`;
@@ -228,7 +172,7 @@ Item {
             }
             root.daemonUnavailable = false;
 
-            const ids = root.parseDeviceList(data.stdout);
+            const ids = DeviceUtils.scanStrings(DeviceUtils.unwrapVariant(data.stdout));
 
             let current = {};
 
@@ -294,8 +238,8 @@ Item {
             }
 
             // 0 is handled in updateOpenRazerDevices()
-            const raw = root.parseNumber(data.stdout);
-            if (raw === undefined)
+            const raw = parseFloat(DeviceUtils.unwrapVariant(data.stdout));
+            if (isNaN(raw))
                 return;
             root.deviceData[id].battery = Math.round(Math.max(0, Math.min(100, raw)));
 
@@ -324,7 +268,7 @@ Item {
 
             if (data["exit code"] !== 0 || !(data.stdout || "").trim())
                 return;
-            root.deviceData[id].charging = root.parseBool(data.stdout);
+            root.deviceData[id].charging = DeviceUtils.unwrapVariant(data.stdout) === "true";
 
             Qt.callLater(root.updateOpenRazerDevices);
         }
@@ -353,7 +297,7 @@ Item {
             if (data["exit code"] !== 0 || (data.stderr || "").trim().length > 0) {
                 return;
             }
-            const value = root.parseString(data.stdout);
+            const value = (DeviceUtils.scanStrings(DeviceUtils.unwrapVariant(data.stdout))[0] || "");
             if (value.length === 0) {
                 return;
             }

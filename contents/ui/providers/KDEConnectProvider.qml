@@ -119,11 +119,7 @@ Item {
             }
 
             // gdbus outputs GVariant format: (['id1', 'id2'],)
-            const ids = []
-            const re = /'([^']+)'/g
-            let m
-            while ((m = re.exec(data.stdout)) !== null)
-                ids.push(m[1])
+            const ids = DeviceUtils.scanStrings(DeviceUtils.unwrapVariant(data.stdout));
             const wasEmpty = Object.keys(root.knownDevices).length === 0
             let current = {}
 
@@ -171,10 +167,10 @@ Item {
             if (data["exit code"] !== 0 || !data.stdout.trim()) return
 
             // gdbus GetAll output: ({'name': <'Phone'>, 'type': <'phone'>, ...},)
-            const nameMatch = data.stdout.match(/'name': <'((?:[^'\\]|\\.)*)'>/)
-            const typeMatch = data.stdout.match(/'type': <'((?:[^'\\]|\\.)*)'>/)
-            if (nameMatch) root.deviceData[id].name = nameMatch[1]
-            if (typeMatch) root.deviceData[id].type = typeMatch[1]
+            const name = DeviceUtils.gvariantValue(data.stdout, "name")
+            const type = DeviceUtils.gvariantValue(data.stdout, "type")
+            if (name !== null) root.deviceData[id].name = name
+            if (type !== null) root.deviceData[id].type = type
             Qt.callLater(root.updateDevices)
         }
     }
@@ -197,10 +193,10 @@ Item {
             if (data["exit code"] !== 0 || !data.stdout.trim()) return
 
             // gdbus GetAll output: ({'charge': <75>, 'isCharging': <false>},)
-            const chargeMatch = data.stdout.match(/'charge': <(-?\d+)>/)
-            const chargingMatch = data.stdout.match(/'isCharging': <(true|false)>/)
-            if (chargeMatch) root.deviceData[id].charge = parseInt(chargeMatch[1])
-            if (chargingMatch) root.deviceData[id].charging = chargingMatch[1] === "true"
+            const charge = DeviceUtils.gvariantValue(data.stdout, "charge")
+            const charging = DeviceUtils.gvariantValue(data.stdout, "isCharging")
+            if (charge !== null) root.deviceData[id].charge = parseInt(charge)
+            if (charging !== null) root.deviceData[id].charging = charging === "true"
             Qt.callLater(root.updateDevices)
         }
     }
