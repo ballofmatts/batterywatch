@@ -1,7 +1,5 @@
 # Changelog
 
-## [Unreleased]
-
 ## [0.3.2] - 2026-09-28
 
 ### Added
@@ -16,6 +14,8 @@
 ### Fixed
 - **G733 battery not reported** — accept long HID++ battery replies for Logitech headsets, addressing the response-format mismatch identified in the G733 descriptor from issue #2. Hardware confirmation pending. Replies are matched to the request that asked for them (device index, feature index and function/software ID) and a HID++ 2.0 error frame is reported — with its code — instead of being decoded as a bogus voltage
 - **Debug output for troubleshooting** — `--debug` now logs the selected node and identity, the exact request bytes, every received packet with the reason it was rejected, and timeouts, on stderr only (stdout stays valid JSON)
+- **Razer devices not detected** — the OpenRazer provider now talks to `openrazer-daemon` through `gdbus` instead of `qdbus` (issue #50). Qt6 renamed the binary to `qdbus6`, so on systems that don't ship the Qt5 `qdbus` (Fedora, NixOS, Arch/CachyOS without `qt5-tools`) every call failed and the widget showed no Razer devices at all. `gdbus` ships with glib2, which Plasma already depends on, and needs no Qt startup per call
+- **OpenRazer failures are no longer silent** — a failing D-Bus call is reported in the Plasma log (`BatteryWatch: OpenRazer daemon unavailable (...)`) and no longer looks identical to "no Razer devices connected"
 
 ### Contributors
 - @MrAdrianPl — reverse-engineered the Keychron M5 battery protocol (hid report probing)
