@@ -31,6 +31,20 @@ TIMEOUT_SEC = 10
 MAX_DEVICES = 8
 HID_BUFFER_SIZE = 64
 
+# Diagnostic logging. With --debug, helper emits stderr lines (never interfering
+# with the JSON on stdout) so a found-but-silent device is visible instead of
+# silently vanishing - the widget has no third state between "blocked" and
+# "readable" for a device that won't answer.
+_DEBUG = "--debug" in sys.argv
+
+def debug(message):
+    if _DEBUG:
+        print(f"[batterywatch] {message}", file=sys.stderr)
+
+def hexbuf(buf):
+    """Space-separated lowercase hex, the packet notation used in --debug output."""
+    return " ".join(f"{b:02x}" for b in buf)
+
 # Request-response devices (e.g. Keychron M5) reply within milliseconds; don't
 # stall the widget for the full stream timeout, especially when the mouse sleeps.
 REQUEST_TIMEOUT_SEC = 1
@@ -68,8 +82,9 @@ class InputStreamSchema(NamedTuple):
     charge_range: tuple[int, int] | None          # Battery charge min, max; None = battery is already reported in %
     status:       DataPos | ChargingStates | None # Charging: direct byte (DataPos), derived from state ID (ChargingStates), or unsupported (None)
 
-    def valid(self, buf) -> bool:
-        return True
+    def rejection_reason(self, buf) -> str | None:
+        # Nothing to match against: a stream has no request to answer
+        return None
 
     def poll_timeout(self) -> float:
         return TIMEOUT_SEC
@@ -82,15 +97,28 @@ class RequestSchema(NamedTuple):
     request:      bytes                           # Packet to send before reading; device replies with battery report
     timeout:      float = REQUEST_TIMEOUT_SEC     # Max wait for the reply; devices answer in milliseconds
     reply_prefix: bytes | None = None             # Expected reply prefix; None keeps the common report-ID + command echo check
+    # Protocol-specific check: None if the packet answers our request, else why not
+    validate_reply: Callable[[bytes], str | None] | None = None
 
-    def valid(self, buf) -> bool:
+    def rejection_reason(self, buf) -> str | None:
+        # both this check and the protocol-specific one index into the packet
+        if len(buf) < 2:
+            return f"{len(buf)}-byte packet is too short to be a reply"
+        if self.validate_reply is not None:
+            return self.validate_reply(buf)
+        if self.reply_prefix is not None:
+            if len(buf) < len(self.reply_prefix) or buf[:len(self.reply_prefix)] != self.reply_prefix:
+                return f"expected prefix {hexbuf(self.reply_prefix)}, got {hexbuf(buf)}"
+            return None
+        if len(self.request) < 2:
+            return None
         # A real battery reply echoes the request's command byte, which tells it
         # apart from unrelated reports on the same interface.
-        if self.reply_prefix is not None:
-            return len(buf) >= len(self.reply_prefix) and buf[:len(self.reply_prefix)] == self.reply_prefix
-        if len(self.request) < 2:
-            return True
-        return buf[0] == self.charge.report_id and buf[1] == self.request[1]
+        if buf[0] != self.charge.report_id:
+            return f"report id {buf[0]:#04x} is not {self.charge.report_id:#04x}"
+        if buf[1] != self.request[1]:
+            return f"device address {buf[1]:#04x} does not echo the requested {self.request[1]:#04x}"
+        return None
 
     def poll_timeout(self) -> float:
         return self.timeout
@@ -162,13 +190,16 @@ class Device(NamedTuple):
 
 
 # ── Logitech headset battery voltage protocol ───────────────────────────────
-# Logitech headsets report a raw battery voltage over HID++: write a 20-byte
-# long message, read a 7-byte short reply on report 0x10 (byte 1 echoes the
-# request's 0xff device byte); only the feature command + mV->% curve differ.
-# Commands, PIDs and curves from headsetcontrol (GPL-3.0): logitech_g533.hpp,
-# logitech_g535.hpp, logitech_gpro.hpp, logitech_g633_g933_935.hpp +
-# protocols/logitech_calibrations.hpp. Battery node = report-descriptor usage
-# page 0xff43 (G535: consumer page 0x0c, so it pins interface 3).
+# Logitech headsets report a raw battery voltage over HID++ 2.0: write a 20-byte
+# long message (report 0x11, e.g. 11 ff 08 0a), read the long reply; only the
+# feature command + mV->% curve differ per model. HID++ 2.0 defines both formats
+# (0x10 short, 0x11 long); we use the long one, as headsetcontrol does. The
+# G733's descriptor (issue #2) declares 85 11 and no 0x10, and hid-generic
+# cannot deliver an undeclared report - but no reply has been captured yet.
+# Commands, PIDs and curves from headsetcontrol (GPL-3.0): logitech_g{533,535,
+# pro,633_g933_935}.hpp + protocols/logitech_calibrations.hpp; frame layout per
+# Logitech/cpg-docs hidpp20 and the kernel's hid-logitech-hidpp. Battery node =
+# report-descriptor usage page 0xff43 (G535: consumer page 0x0c, pins interface 3).
 # Status (third-party sources only - unfortunately, I don't have the real hardware to
 # verify these myself): G733 0x0AB5/0x0AFE, G533, G535, G933, G935 and
 # G PRO X follow from Solaar captures/device lists; G733 v3 0x0B1F,
@@ -184,21 +215,77 @@ GPRO_CURVE = ((100, 4150), (50, 3830), (30, 3780), (20, 3740), (5, 3670), (0, 33
 # unrelated report on the same interface) - discard and keep waiting.
 KEEP_READING = object()
 
+# Long report, 20 bytes (HID++ 2.0 also defines a 7-byte short 0x10)
+HIDPP_LONG  = 0x11
+# Bytes needed before byte 6 (the charge state) can be read at all
+HIDPP_BATTERY_LEN = 7
+# An error frame carries its code in the last byte, so 6 is the floor for one
+HIDPP_ERROR_LEN = 6
+# A headset pack is a single Li-ion cell (4.2 V nominal), so nothing above this
+# can be its voltage
+HIDPP_MAX_MILLIVOLTS = 4600
+# "0xff is reserved for corded devices and receivers" - the device index we send
+HIDPP_REPLY_ADDRESS = 0xFF
+# Feature index 0xff marks an error frame, code at byte 5. Only one echoing our
+# own feature/function is ours to report (as in the kernel's hidpp_match_error);
+# a foreign 0xff is not a voltage, but its meaning is not ours to guess.
+HIDPP_ERROR_FEATURE = 0xFF
+# HID++ 2.0 error codes (Logitech/cpg-docs hidpp20, "HID++2.0 error codes")
+HIDPP_ERRORS = {0: "NoError", 1: "Unknown", 2: "InvalidArgument", 3: "OutOfRange",
+                4: "HWError", 5: "Logitech internal", 6: "INVALID_FEATURE_INDEX",
+                7: "INVALID_FUNCTION_ID", 8: "Busy", 9: "Unsupported"}
+
+
+def _logitech_reply_check(request):
+    """Accepts only the HID++ reply that answers this headset's battery request.
+
+    Returns None when the packet is that reply, else the reason it was rejected.
+    """
+    def check(buf):
+        if not buf:
+            return "empty packet"
+        if buf[0] != HIDPP_LONG:
+            return f"report id {buf[0]:#04x} is not {HIDPP_LONG:#04x}"
+        if len(buf) < HIDPP_ERROR_LEN:
+            return f"{len(buf)}-byte packet is too short for a HID++ reply"
+
+        # bytes 1-3 echo the request, including the software ID that separates
+        # replies meant for other applications (Logitech/cpg-docs hidpp20)
+        if buf[1] != request[1]:
+            return f"device index {buf[1]:#04x} does not echo the requested {request[1]:#04x}"
+        if buf[2] == HIDPP_ERROR_FEATURE:
+            # an error frame's echo sits one byte later than the request's
+            if buf[3] == request[2] and buf[4] == request[3]:
+                code = buf[5]
+                return (f"HID++ 2.0 error reply answering our request: code {code} "
+                        f"({HIDPP_ERRORS.get(code, 'unassigned')})")
+            return (f"HID++ error marker 0xff for another feature/function "
+                    f"({buf[3]:#04x} {buf[4]:#04x}, code {buf[5]}) - not an answer "
+                    f"to this request, not a battery reply")
+        if buf[2] != request[2]:
+            return f"feature index {buf[2]:#04x} is not {request[2]:#04x}"
+        if buf[3] != request[3]:
+            return f"function/software id {buf[3]:#04x} is not {request[3]:#04x}"
+
+        if len(buf) < HIDPP_BATTERY_LEN:
+            return f"{len(buf)} bytes is too short for the charge state (byte 6)"
+        return None
+    return check
+
 
 def _logitech_voltage_parse(curve):
-    # 0x10 reply: [0]=0x10, [1]=0xff (echo of the request's device byte),
-    # [2]=status (0xff = device off), [3]=reserved, [4..5]=voltage big-endian,
-    # [6]=charge state (0x01 discharging, 0x03 charging) - same semantics as
-    # the flags byte of the G733's HID++ ADC battery feature in Solaar captures.
+    # [4..5] = voltage big-endian, [6] = charge state (0x03 charging), the layout
+    # HeadsetControl reads. The 0xff guard is unreachable (the validator rejects
+    # it first) and only keeps bytes 4-5 from ever being read as a voltage.
     def parse(buffers):
-        buf = buffers[0x10]
-        if buf[2] == 0xFF:
-            return None  # device off / not sending - definitive answer
+        buf = buffers.get(HIDPP_LONG)
+        if buf is None or len(buf) < HIDPP_BATTERY_LEN:
+            return KEEP_READING  # nothing parsable: keep waiting for a real reply
+        if buf[2] == HIDPP_ERROR_FEATURE:
+            return None  # never a voltage
         voltage_mv = (buf[4] << 8) | buf[5]
-        if voltage_mv < curve[-1][1]:
-            return KEEP_READING  # below the lowest calibrated voltage: not the battery frame
-        if voltage_mv > 4600:
-            return KEEP_READING  # implausibly high for a single-cell Li-ion: not the battery frame
+        if not curve[-1][1] <= voltage_mv <= HIDPP_MAX_MILLIVOLTS:
+            return KEEP_READING  # outside any calibrated range: not the battery frame
         return {"percentage": _voltage_percentage(voltage_mv, curve),
                 "charging": buf[6] == 0x03}
     return parse
@@ -206,17 +293,19 @@ def _logitech_voltage_parse(curve):
 
 def _logitech_headset(name, cmd, curve, *pids, usage_page=0xFF43, iface=None):
     """A single Logitech headset; returns the ready-made Device."""
+    request = bytes([HIDPP_LONG, HIDPP_REPLY_ADDRESS, cmd[0], cmd[1]]) + b"\x00" * 16
     return Device(
         name=name,
         device_type=DeviceType.HEADSET,
         vid=0x046D,
         variants=tuple(DeviceVariant(pid, iface, usage_page) for pid in pids),
         source=RequestSchema(
-            charge=DataPos(0x10, 4),
+            charge=DataPos(HIDPP_LONG, 4),
             charge_range=None,
-            status=ChargingStates(pos=DataPos(0x10, 6), states={0x01: False, 0x03: True}),
-            request=bytes([0x11, 0xFF, cmd[0], cmd[1]]) + b"\x00" * 16,
+            status=ChargingStates(pos=DataPos(HIDPP_LONG, 6), states={0x01: False, 0x03: True}),
+            request=request,
             timeout=REQUEST_TIMEOUT_SEC,
+            validate_reply=_logitech_reply_check(request),
         ),
         parse=_logitech_voltage_parse(curve),
     )
@@ -563,6 +652,12 @@ def find_devices():
         usage_pages = hid_usage_pages(f"/sys/class/hidraw/{name}/device/report_descriptor") if pid in _USAGE_PAGE_PIDS else set()
         matched = match_device(vid, pid, iface, usage_pages)
         if matched is None:
+            if pid in _USAGE_PAGE_PIDS:
+                # The usage page is what selects the battery node among a
+                # device's interfaces, so a miss here is worth explaining
+                debug(f"{name}: {vid:04x}:{pid:04x} (iface {iface}) has usage pages "
+                      f"{sorted(hex(p) for p in usage_pages) or 'none'}, "
+                      f"none matching a known battery node")
             continue
         desc, variant = matched
 
@@ -582,7 +677,10 @@ def find_devices():
         if serial == "unknown-hid":
             serial = phys or name
 
-        devices.append(FoundDevice(f"/dev/{name}", serial, desc, pid, variant.source or desc.source))
+        devpath = f"/dev/{name}"
+        debug(f"{devpath}: reading {desc.name} {vid:04x}:{pid:04x} "
+              f"(iface {iface}, usage pages {[hex(p) for p in sorted(usage_pages)] or 'not read'})")
+        devices.append(FoundDevice(devpath, serial, desc, pid, variant.source or desc.source))
     return devices
 
 # True when the device is present but its hidraw node can't be opened for the
@@ -606,19 +704,23 @@ def open_device(dev, schema):
     flags = os.O_RDWR if needs_write else os.O_RDONLY
     try:
         fd = os.open(dev.devpath, flags | os.O_NONBLOCK)
-    except OSError:
+    except OSError as e:
+        debug(f"{dev.desc.name}: open({dev.devpath}, "
+              f"{'O_RDWR' if needs_write else 'O_RDONLY'}) failed: {e}")
         return None
 
     if needs_write:
         try:
+            debug(f"{dev.desc.name}: write {hexbuf(schema.request)} ({len(schema.request)} bytes)")
             os.write(fd, schema.request)
-        except OSError:
+        except OSError as e:
+            debug(f"{dev.desc.name}: write of {hexbuf(schema.request)} failed: {e}")
             os.close(fd)
             return None
 
     return fd
 
-# Reads a device's power status: waits for the report(s) the schema needs or for
+# Reads a device's power status: waits for a report the schema accepts or for
 # the schema's timeout. O_NONBLOCK + poll() makes it sleep in kernel with 0 CPU
 # utilisation. Returns status dict {"percentage", "charging"} or None.
 def read_status_hw(dev):
@@ -638,34 +740,52 @@ def read_status_hw(dev):
         poller.register(fd, select.POLLIN)
         deadline = time.monotonic() + schema.poll_timeout()
         buffers = {}
+        wanted = ", ".join(f"{r:#04x}" for r in needed)
+
+        def no_reply():
+            debug(f"{dev.desc.name}: no accepted reply (report {wanted}) within "
+                  f"{schema.poll_timeout():g}s ({dev.devpath})")
+            return None
 
         while True:
             timeout_ms = int((deadline - time.monotonic()) * 1000)
             if timeout_ms <= 0:
-                return None
+                return no_reply()
 
             events = poller.poll(timeout_ms)
             if not events:
-                return None
+                return no_reply()
 
             _, revents = events[0]
             # POLLERR/POLLHUP/POLLNVAL = device error / disconnected / invalid FD
             if revents & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                debug(f"{dev.desc.name}: device error or disconnect "
+                      f"(poll flags {revents:#x})")
                 return None
             if not (revents & select.POLLIN):
                 return None
 
             try:
                 buf = os.read(fd, read_size)
-            except OSError:
+            except OSError as e:
+                debug(f"{dev.desc.name}: read failed: {e}")
                 return None
             if not buf:
                 continue
 
+            debug(f"{dev.desc.name}: received {hexbuf(buf)} ({len(buf)} bytes)")
             report_id = buf[0]
-            if report_id not in needed or len(buf) < needed[report_id]:
+            if report_id not in needed:
+                debug(f"{dev.desc.name}: ignored: report id {report_id:#04x} is not a "
+                      f"battery report - this device answers on {wanted}")
                 continue
-            if not schema.valid(buf):
+            if len(buf) < needed[report_id]:
+                debug(f"{dev.desc.name}: ignored: {len(buf)} bytes is fewer than the "
+                      f"{needed[report_id]} needed to read report {report_id:#04x}")
+                continue
+            reason = schema.rejection_reason(buf)
+            if reason is not None:
+                debug(f"{dev.desc.name}: ignored: {reason}")
                 continue
 
             buffers[report_id] = buf
@@ -674,10 +794,15 @@ def read_status_hw(dev):
                 if dev.desc.parse is not None:
                     result = dev.desc.parse(buffers)
                     if result is KEEP_READING:
+                        debug(f"{dev.desc.name}: {hexbuf(buf)} looks plausible "
+                              f"but parse() says keep waiting")
                         buffers.pop(report_id, None)  # not the battery frame; keep waiting for a better one
                         continue
+                    debug(f"{dev.desc.name}: reading {result}")
                     return result
-                return interpret(schema, buffers)
+                status = interpret(schema, buffers)
+                debug(f"{dev.desc.name}: reading {status}")
+                return status
     finally:
         os.close(fd)
 
@@ -724,9 +849,17 @@ def _device_entry(dev):
                 "vid": f"{dev.desc.vid:04x}", "pid": f"{dev.pid:04x}",
                 "unblock_command": udev_unblock_command(dev.desc.vid),
                 "deviceType": dev.desc.device_type.value}
+    # Found, openable, but no reading - e.g. a headset the schema can't make
+    # answer. Normally this entry is dropped (invisible); with --debug we make
+    # the drop explicit so the cause is visible in the helper's stderr.
+    debug(f"{dev.desc.name}: found but read returned nothing - entry dropped "
+          f"({dev.devpath})")
     return None
 
 def main():
+    if _DEBUG:
+        # Strip the flag so the logic below sees the same argv as without it.
+        sys.argv.pop(sys.argv.index("--debug"))
     if len(sys.argv) > 1 and sys.argv[1] == "--simulate":
         print(json.dumps(_simulate()))
         sys.exit(0)

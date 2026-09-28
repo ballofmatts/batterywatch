@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [0.3.2] - 2026-08-22
+## [0.3.2] - 2026-09-28
 
 ### Added
 - **Keychron M5 support** — new request-response HID schema (0xB3:06 request / 0xB4 reply) reads the M5's battery over the vendor interface; works both wireless (Ultra-Link 8K dongle) and wired (USB-C); correct charging decode
@@ -13,10 +13,15 @@
 - **User-run udev authorization** — a device whose battery needs extra permission now shows a lock icon and a "Copy command" button; the user pastes one `sudo tee` command in a terminal on their own terms. A single rule file per device covers all its connection variants (wireless + wired)
 - **Stateless HID polling** — the helper reports only a current reading each 5s poll, so charging state updates promptly and devices that stop answering (asleep, or a wired mouse's idle dongle) drop immediately instead of showing stale entries
 
+### Fixed
+- **G733 battery not reported** — accept long HID++ battery replies for Logitech headsets, addressing the response-format mismatch identified in the G733 descriptor from issue #2. Hardware confirmation pending. Replies are matched to the request that asked for them (device index, feature index and function/software ID) and a HID++ 2.0 error frame is reported — with its code — instead of being decoded as a bogus voltage
+- **Debug output for troubleshooting** — `--debug` now logs the selected node and identity, the exact request bytes, every received packet with the reason it was rejected, and timeouts, on stderr only (stdout stays valid JSON)
+
 ### Contributors
 - @MrAdrianPl — reverse-engineered the Keychron M5 battery protocol (hid report probing)
-- StarPepe — on-device testing and verification of the M5 support
+- @StarPepe — on-device testing and verification of the M5 support
 - @LookforFPS — ROG Azoth battery support (wired USB, 2.4 GHz dongle and OMNI receiver), reverse-engineered on hardware
+- @CorneliusKluge — issue #2 on-device diagnostics: the hidraw report descriptor that identified the G733's long-report response as the cause of the missing battery reading
 
 ## [0.3.1] - 2026-07-01
 
@@ -99,7 +104,7 @@
 
 Initial development releases (v0.1.0 – v0.1.9, through 2026-01-03). Core functionality: monitor battery levels of Bluetooth and wireless devices via UPower, with OpenLinkHub and BatteryWatch Companion integration.
 
-[Unreleased]: https://github.com/itayavra/batterywatch/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/itayavra/batterywatch/compare/v0.3.2...HEAD
 [0.3.2]: https://github.com/itayavra/batterywatch/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/itayavra/batterywatch/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/itayavra/batterywatch/compare/v0.2.2...v0.3.0
