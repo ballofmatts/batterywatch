@@ -97,13 +97,11 @@ class RequestSchema(NamedTuple):
     request:      bytes                           # Packet to send before reading; device replies with battery report
     timeout:      float = REQUEST_TIMEOUT_SEC     # Max wait for the reply; devices answer in milliseconds
     reply_prefix: bytes | None = None             # Expected reply prefix; None keeps the common report-ID + command echo check
-    # Protocol-specific reply check: None when the packet answers our request,
-    # else the reason it was rejected (printed by --debug)
+    # Protocol-specific check: None if the packet answers our request, else why not
     validate_reply: Callable[[bytes], str | None] | None = None
 
     def rejection_reason(self, buf) -> str | None:
-        # Both this check and the protocol-specific one index into the packet,
-        # so a read shorter than that is never a reply
+        # both this check and the protocol-specific one index into the packet
         if len(buf) < 2:
             return f"{len(buf)}-byte packet is too short to be a reply"
         if self.validate_reply is not None:
@@ -194,17 +192,14 @@ class Device(NamedTuple):
 # ── Logitech headset battery voltage protocol ───────────────────────────────
 # Logitech headsets report a raw battery voltage over HID++ 2.0: write a 20-byte
 # long message (report 0x11, e.g. 11 ff 08 0a), read the long reply; only the
-# feature command + mV->% curve differ between models. The long report is the
-# only option on this family - HID++ 1.0 has none, hid-generic cannot deliver an
-# undeclared report, and the G733's descriptor declares 85 11 and no 0x10
-# (issue #2).
-# Commands, PIDs and curves from headsetcontrol (GPL-3.0): logitech_g533.hpp,
-# logitech_g535.hpp, logitech_gpro.hpp, logitech_g633_g933_935.hpp +
-# protocols/logitech_calibrations.hpp. Frame layout from the Logitech HID++ 2.0
-# tables (Logitech/cpg-docs hidpp20, Solaar hidpp20_constants), cross-checked
-# against the kernel's hid-logitech-hidpp, which sends device address 0xff.
-# Battery node = report-descriptor usage page 0xff43 (G535: consumer page 0x0c,
-# so it pins interface 3).
+# feature command + mV->% curve differ per model. HID++ 2.0 defines both formats
+# (0x10 short, 0x11 long); we use the long one, as headsetcontrol does. The
+# G733's descriptor (issue #2) declares 85 11 and no 0x10, and hid-generic
+# cannot deliver an undeclared report - but no reply has been captured yet.
+# Commands, PIDs and curves from headsetcontrol (GPL-3.0): logitech_g{533,535,
+# pro,633_g933_935}.hpp + protocols/logitech_calibrations.hpp; frame layout per
+# Logitech/cpg-docs hidpp20 and the kernel's hid-logitech-hidpp. Battery node =
+# report-descriptor usage page 0xff43 (G535: consumer page 0x0c, pins interface 3).
 # Status (third-party sources only - unfortunately, I don't have the real hardware to
 # verify these myself): G733 0x0AB5/0x0AFE, G533, G535, G933, G935 and
 # G PRO X follow from Solaar captures/device lists; G733 v3 0x0B1F,
@@ -220,7 +215,7 @@ GPRO_CURVE = ((100, 4150), (50, 3830), (30, 3780), (20, 3740), (5, 3670), (0, 33
 # unrelated report on the same interface) - discard and keep waiting.
 KEEP_READING = object()
 
-# These are HID++ 2.0 devices: long report only (see above).
+# Long report, 20 bytes (HID++ 2.0 also defines a 7-byte short 0x10)
 HIDPP_LONG  = 0x11
 # Bytes needed before byte 6 (the charge state) can be read at all
 HIDPP_BATTERY_LEN = 7
@@ -229,25 +224,19 @@ HIDPP_ERROR_LEN = 6
 # A headset pack is a single Li-ion cell (4.2 V nominal), so nothing above this
 # can be its voltage
 HIDPP_MAX_MILLIVOLTS = 4600
-# "0xff is reserved for corded devices and receivers" - the address we send
+# "0xff is reserved for corded devices and receivers" - the device index we send
 HIDPP_REPLY_ADDRESS = 0xFF
-# Reply byte 3 is function | software ID. Devices differ on whether they echo
-# the software ID, so only the function (high nibble) has to match; a differing
-# low nibble is logged, not rejected.
-HIDPP_FUNCTION_MASK = 0xF0
-# Feature index 0xff marks a HID++ 2.0 error frame. Logitech also uses 0xff
-# there as its "headset not connected" marker, so the feature byte alone cannot
-# tell them apart - but an error frame echoes the request's feature and function
-# bytes (the kernel's hidpp_match_error draws the same line) and that does.
-# Either way bytes 4-5 are NOT a battery voltage.
+# Feature index 0xff marks an error frame, code at byte 5. Only one echoing our
+# own feature/function is ours to report (as in the kernel's hidpp_match_error);
+# a foreign 0xff is not a voltage, but its meaning is not ours to guess.
 HIDPP_ERROR_FEATURE = 0xFF
-# HID++ 2.0 error codes (draft specification, "HID++2.0 error codes")
+# HID++ 2.0 error codes (Logitech/cpg-docs hidpp20, "HID++2.0 error codes")
 HIDPP_ERRORS = {0: "NoError", 1: "Unknown", 2: "InvalidArgument", 3: "OutOfRange",
                 4: "HWError", 5: "Logitech internal", 6: "INVALID_FEATURE_INDEX",
                 7: "INVALID_FUNCTION_ID", 8: "Busy", 9: "Unsupported"}
 
 
-def _logitech_reply_check(request, cmd):
+def _logitech_reply_check(request):
     """Accepts only the HID++ reply that answers this headset's battery request.
 
     Returns None when the packet is that reply, else the reason it was rejected.
@@ -260,43 +249,40 @@ def _logitech_reply_check(request, cmd):
         if len(buf) < HIDPP_ERROR_LEN:
             return f"{len(buf)}-byte packet is too short for a HID++ reply"
 
-        address = buf[1]
-        if address != HIDPP_REPLY_ADDRESS and not 0x01 <= address <= 0x0F:
-            return (f"device address {address:#04x} is neither 0xff (direct) "
-                    f"nor a receiver index (0x01-0x0f)")
-
+        # bytes 1-3 echo the request, including the software ID that separates
+        # replies meant for other applications (Logitech/cpg-docs hidpp20)
+        if buf[1] != request[1]:
+            return f"device index {buf[1]:#04x} does not echo the requested {request[1]:#04x}"
         if buf[2] == HIDPP_ERROR_FEATURE:
-            if buf[3] == cmd[0] and buf[4] == request[3]:
+            # an error frame's echo sits one byte later than the request's
+            if buf[3] == request[2] and buf[4] == request[3]:
                 code = buf[5]
                 return (f"HID++ 2.0 error reply answering our request: code {code} "
-                        f"({HIDPP_ERRORS.get(code, 'unassigned')}), echoed feature "
-                        f"{buf[3]:#04x} function {buf[4]:#04x}")
-            return ("feature byte 0xff without our feature/function echo - Logitech's "
-                    "headset-offline marker (headset off, or empty receiver slot), "
-                    "not a battery reply")
+                        f"({HIDPP_ERRORS.get(code, 'unassigned')})")
+            return (f"HID++ error marker 0xff for another feature/function "
+                    f"({buf[3]:#04x} {buf[4]:#04x}, code {buf[5]}) - not an answer "
+                    f"to this request, not a battery reply")
+        if buf[2] != request[2]:
+            return f"feature index {buf[2]:#04x} is not {request[2]:#04x}"
+        if buf[3] != request[3]:
+            return f"function/software id {buf[3]:#04x} is not {request[3]:#04x}"
 
         if len(buf) < HIDPP_BATTERY_LEN:
             return f"{len(buf)} bytes is too short for the charge state (byte 6)"
-        if buf[2] != cmd[0]:
-            return f"feature index {buf[2]:#04x} is not {cmd[0]:#04x}"
-        if buf[3] & HIDPP_FUNCTION_MASK != request[3] & HIDPP_FUNCTION_MASK:
-            return f"function {buf[3]:#04x} is not {request[3]:#04x}"
-        if buf[3] != request[3]:
-            debug(f"reply echoes function byte {buf[3]:#04x} instead of the requested {request[3]:#04x}")
         return None
     return check
 
 
 def _logitech_voltage_parse(curve):
-    # [4..5] = voltage big-endian, [6] = charge state (0x03 charging) - the
-    # layout HeadsetControl reads on real hardware. [2] == 0xff is the error or
-    # headset-offline marker; the validator logged which reading fits.
+    # [4..5] = voltage big-endian, [6] = charge state (0x03 charging), the layout
+    # HeadsetControl reads. The 0xff guard is unreachable (the validator rejects
+    # it first) and only keeps bytes 4-5 from ever being read as a voltage.
     def parse(buffers):
         buf = buffers.get(HIDPP_LONG)
         if buf is None or len(buf) < HIDPP_BATTERY_LEN:
             return KEEP_READING  # nothing parsable: keep waiting for a real reply
         if buf[2] == HIDPP_ERROR_FEATURE:
-            return None  # error reply or headset off - definitive answer
+            return None  # never a voltage
         voltage_mv = (buf[4] << 8) | buf[5]
         if not curve[-1][1] <= voltage_mv <= HIDPP_MAX_MILLIVOLTS:
             return KEEP_READING  # outside any calibrated range: not the battery frame
@@ -319,7 +305,7 @@ def _logitech_headset(name, cmd, curve, *pids, usage_page=0xFF43, iface=None):
             status=ChargingStates(pos=DataPos(HIDPP_LONG, 6), states={0x01: False, 0x03: True}),
             request=request,
             timeout=REQUEST_TIMEOUT_SEC,
-            validate_reply=_logitech_reply_check(request, cmd),
+            validate_reply=_logitech_reply_check(request),
         ),
         parse=_logitech_voltage_parse(curve),
     )
@@ -803,8 +789,7 @@ def read_status_hw(dev):
                 continue
 
             buffers[report_id] = buf
-            # parse(), if set, sees only accepted reports, so every byte it
-            # reads needs to be declared via charge/status positions.
+            # parse(), if set, sees only such report, so every byte needs to be declared via charge/status positions
             if all(r in buffers for r in needed):
                 if dev.desc.parse is not None:
                     result = dev.desc.parse(buffers)

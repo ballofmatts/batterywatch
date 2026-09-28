@@ -176,8 +176,8 @@ def hid_descriptor(usage_page=0xFF43):
 def install_g733_scenario(iface=3, usage_page=0xFF43, with_blocked=False):
     # Logitech HID++ headset: battery node on usage page 0xff43 (iface is now
     # irrelevant to matching - only the report descriptor page decides), request
-    # 11 ff 08 0a, long 0x11 reply (the only report this family's descriptor
-    # declares)
+    # 11 ff 08 0a, long 0x11 reply (the G733 descriptor in issue #2 declares
+    # 85 11 and no 0x10; no reply from real hardware has been captured yet)
     scenario["uevents"] = {
         "hidraw8": ("DRIVER=hid-generic\nHID_ID=0003:0000046D:00000AB5\n"
                     "HID_NAME=Logitech G733 LIGHTSPEED\n"
@@ -706,8 +706,8 @@ def test_simulate_both_report_after_both_rules():
 # captured reply bytes. The frames below are therefore built from the
 # documented HID++ 2.0 frame layout (Logitech/cpg-docs hidpp20 tables, Solaar
 # hidpp20) rather than from a recording:
-#   [0] report id (0x11 long = 20 bytes - the only one this family declares)
-#   [1] device address   [2] feature index   [3] function/software id
+#   [0] report id (0x11 long, 20 bytes; HID++ 2.0 also defines a 7-byte short 0x10)
+#   [1] device index (echo of 0xff)   [2] feature index   [3] function/software id
 #   [4..5] voltage (big endian)   [6] charge state (0x01 discharging, 0x03 charging)
 #   error reply: feature index 0xff + echoed feature/function + code at byte 5
 # ══════════════════════════════════════════════════════════════════════════
@@ -741,8 +741,9 @@ def test_logitech_long_reply_produces_battery_reading():
     assert g733_reads(report_id=0x11, voltage_mv=4050, state=0x01) == {"percentage": 93, "charging": False}
 
 def test_logitech_short_reply_is_not_accepted():
-    # HID++ 1.0 shape: this family is HID++ 2.0 and its descriptor declares no
-    # 0x10 report, so a 0x10 packet must never be read as a battery reply
+    # the G733's descriptor (issue #2) declares report 0x11 and no 0x10, and
+    # hid-generic cannot deliver an undeclared report, so a 0x10 packet must
+    # never be read as a battery reply
     assert g733_reads(report_id=0x10, voltage_mv=4050, state=0x01) is None
 
 def test_logitech_long_reply_charging():
@@ -794,14 +795,32 @@ def test_logitech_rejects_wrong_address_feature_and_function():
     assert check(g733_frame(report_id=0x11, func=0x15, voltage_mv=4050)), "other function"
     assert check(g733_frame(report_id=0x11, voltage_mv=4050)) is None, "the battery reply itself"
 
-def test_logitech_accepts_addressed_index_and_other_software_id():
-    # 0xff is the corded/receiver address this helper sends; a receiver index is
-    # a valid address too, and the software-ID nibble of the function byte is
-    # echoed by some firmware and not by others, so it must not decide a match
+def test_logitech_rejects_replies_meant_for_another_address_or_application():
+    # byte 1 is the device index we addressed (0xff) and byte 3 carries the
+    # software ID, which exists to separate replies meant for other applications
+    # (Logitech/cpg-docs hidpp20). Accepting a near miss would report whichever
+    # stale frame arrived first, so both halves have to match exactly.
     install_g733_scenario()
     check = rhd.find_devices()[0].source.rejection_reason
-    assert check(g733_frame(report_id=0x11, device=0x01, voltage_mv=4050)) is None
-    assert check(g733_frame(report_id=0x11, func=0x0B, voltage_mv=4050)) is None
+    for device in (0x00, 0x01, 0x03, 0x0F):
+        reason = check(g733_frame(report_id=0x11, device=device, voltage_mv=3600))
+        assert reason and "device index" in reason, f"address {device:#04x}: {reason}"
+    for func in (0x00, 0x0B, 0x0D):
+        reason = check(g733_frame(report_id=0x11, func=func, voltage_mv=3600))
+        assert reason and "function/software id" in reason, f"function byte {func:#04x}: {reason}"
+    assert check(g733_frame(report_id=0x11, voltage_mv=4050)) is None, "the matching reply itself"
+
+def test_logitech_unrelated_reply_before_the_real_one_is_skipped():
+    # the matching bug: a frame that is not ours arrives first and used to be
+    # reported instead of the battery reply that followed it
+    install_g733_scenario()
+    scenario["reply_buf"] = bytearray(0)
+    scenario["reply_queue"] = [
+        g733_frame(report_id=0x11, device=0x03, func=0x00, voltage_mv=3600),
+        g733_frame(report_id=0x11, voltage_mv=4050),
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {"percentage": 93, "charging": False}
+    assert len(scenario["reads"]) == 2, "the unrelated frame did not end the read"
 
 def test_logitech_truncated_packets_never_crash_or_decode():
     install_g733_scenario()
@@ -824,19 +843,24 @@ def test_logitech_validator_checks_the_report_id_itself():
     assert reason and "0x10" in reason and "0x11" in reason, reason
     assert check(g733_frame(report_id=0x11, voltage_mv=4050)) is None
 
-def test_logitech_gpro_series_accepts_issue_47_software_id_echo():
-    # issue #47: a PRO X Wireless (0x0aba) answers the same feature 0x06 request
-    # with function/software-ID byte 0x00 where the G PRO profile sends 0x0d.
-    # Only the function (high nibble) decides a match, so that reply reads.
+def test_logitech_gpro_series_keeps_issue_47_profile_without_relaxed_matching():
+    # issue #47: a PRO X Wireless (0x0aba) answers feature 0x06 with the exact
+    # bytes it was sent - 06 00 for a 06 00 request - which a strict check
+    # accepts. It stays in the shared G PRO profile; if a model ever needs a
+    # different software ID it gets its own profile, not a relaxed check.
     install_g733_scenario()
     gpro = next(d for d in rhd.KNOWN_DEVICES if d.name == "Logitech G PRO Series")
     check, parse = gpro.source.rejection_reason, gpro.parse
     assert 0x0ABA in [v.pid for v in gpro.variants], "the PRO X Wireless keeps its profile"
     assert gpro.source.request[:4] == bytes([0x11, 0xFF, 0x06, 0x0D])
-    for fnsw in (0x00, 0x0D):
-        reply = bytes([0x11, 0xFF, 0x06, fnsw, 0x0F, 0xD2, 0x01]).ljust(20, b"\x00")
-        assert check(reply) is None, f"function byte {fnsw:#04x} must be accepted"
-        assert parse({0x11: bytearray(reply)}) == {"percentage": 84, "charging": False}
+    reply = bytes([0x11, 0xFF, 0x06, 0x0D, 0x0F, 0xD2, 0x01]).ljust(20, b"\x00")
+    assert check(reply) is None
+    assert parse({0x11: bytearray(reply)}) == {"percentage": 84, "charging": False}
+    # issue #47's capture used software ID 0; a reply carrying a software ID we
+    # did not send is another application's and is not ours to report
+    other = bytes([0x11, 0xFF, 0x06, 0x00, 0x0F, 0xD2, 0x01]).ljust(20, b"\x00")
+    reason = check(other)
+    assert reason and "function/software id" in reason, reason
 
 def test_logitech_error_reply_is_recorded_and_never_a_voltage():
     # the error frame's bytes 4-5 are the echoed feature/function: 0x080a looks
@@ -849,17 +873,21 @@ def test_logitech_error_reply_is_recorded_and_never_a_voltage():
     reason = check(g733_frame(report_id=0x11, error=0x06))
     assert "INVALID_FEATURE_INDEX" in reason, reason
 
-def test_logitech_distinguishes_error_frame_from_headset_offline():
-    # byte 2 = 0xff means both "HID++ 2.0 error" and "headset not connected"
-    # (HeadsetControl). An error frame echoes the request's feature/function -
-    # the kernel's own hidpp_match_error rule - the offline marker does not.
+def test_logitech_unmatched_0xff_is_reported_without_guessing_its_meaning():
+    # byte 2 = 0xff is a HID++ 2.0 error marker. An error that echoes our own
+    # feature/function is ours to report (the kernel's hidpp_match_error rule);
+    # one that does not could be answering another application, so it is logged
+    # as received and not labelled with a cause we cannot evidence.
     install_g733_scenario()
     check = rhd.find_devices()[0].source.rejection_reason
     reason = check(g733_frame(report_id=0x11, error=0x08))
     assert "error reply answering our request" in reason, reason
-    offline = check(g733_frame(report_id=0x11, feature=0x04, error=0x01))
-    assert "headset-offline marker" in offline, offline
-    assert "Busy" not in offline, "an offline marker carries no error code to report"
+    assert "Busy" in reason, "our own error keeps its code"
+    other = check(g733_frame(report_id=0x11, feature=0x04, error=0x01))
+    assert "not an answer to this request" in other, other
+    assert "another feature/function" in other and "code 1" in other, other
+    assert "offline" not in other.lower(), f"must not claim the headset is off: {other}"
+    assert "headset" not in other.lower(), f"must not claim a device state: {other}"
 
 def test_logitech_error_reply_keeps_waiting_then_reports_nothing():
     install_g733_scenario()
@@ -871,13 +899,13 @@ def test_logitech_error_reply_keeps_waiting_then_reports_nothing():
     assert rhd.read_status(rhd.find_devices()[0]) == {"percentage": 93, "charging": False}
     assert len(scenario["reads"]) == 2, "the error frame did not end the read"
 
-def test_logitech_g733_offline_produces_no_entry():
-    # a headset that is off (or an empty receiver slot) answers with the 0xff
-    # feature byte instead of a voltage; neither reading case is a battery
+def test_logitech_0xff_marker_produces_no_entry():
+    # a 0xff feature byte - whatever it means - is never a voltage, and a read
+    # that only ever sees one reports nothing
     install_g733_scenario()
-    set_g733_reply(report_id=0x11, feature=0x04, error=0x01)   # offline marker
+    set_g733_reply(report_id=0x11, feature=0x04, error=0x01)   # error for another feature
     assert rhd._device_entry(rhd.find_devices()[0]) is None
-    set_g733_reply(report_id=0x11, error=0x01)                 # error frame
+    set_g733_reply(report_id=0x11, error=0x01)                 # error for our request
     assert rhd._device_entry(rhd.find_devices()[0]) is None
 
 def test_logitech_voltage_parse_low_voltage_keeps_reading():
