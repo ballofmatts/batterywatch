@@ -18,6 +18,7 @@ echo "Building $PLASMOID_NAME..."
 zip -r "$OUTPUT_DIR/$PLASMOID_NAME" . \
     -x "contents/screenshots/*" \
     -x "contents/bin/tests/*" \
+    -x "*.test.*" \
     -x "*__pycache__/*" \
     -x "*.pyc" \
     -x "build-plasmoid.sh" \

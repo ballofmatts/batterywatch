@@ -2,6 +2,7 @@ import QtQuick 2.15
 import org.kde.plasma.plasma5support 2.0 as P5Support
 import org.kde.plasma.plasmoid 2.0
 import "../DeviceUtils.js" as DeviceUtils
+import "../GVariant.js" as GVariant
 
 // Razer device provider
 // Based on UPowerProvider.qml
@@ -172,10 +173,17 @@ Item {
             }
             root.daemonUnavailable = false;
 
-            const ids = DeviceUtils.scanStrings(DeviceUtils.unwrapVariant(data.stdout));
+            let ids;
+            try {
+                ids = GVariant.parseReply(data.stdout);
+                if (!Array.isArray(ids) || !ids.every(id => typeof id === "string"))
+                    throw new Error("expected an array of device ids");
+            } catch (error) {
+                console.warn(i18n("BatteryWatch: unreadable OpenRazer reply (%1)", error.message));
+                return;
+            }
 
             let current = {};
-
             ids.forEach(id => {
                 current[id] = true;
 
@@ -237,10 +245,19 @@ Item {
                 return;
             }
 
-            // 0 is handled in updateOpenRazerDevices()
-            const raw = parseFloat(DeviceUtils.unwrapVariant(data.stdout));
-            if (isNaN(raw))
+            if (data["exit code"] !== 0)
                 return;
+
+            // 0 is handled in updateOpenRazerDevices()
+            let raw;
+            try {
+                raw = GVariant.parseReply(data.stdout);
+                if (typeof raw !== "number" || !Number.isFinite(raw))
+                    throw new Error("expected a finite number");
+            } catch (error) {
+                console.warn(i18n("BatteryWatch: unreadable OpenRazer reply (%1)", error.message));
+                return;
+            }
             root.deviceData[id].battery = Math.round(Math.max(0, Math.min(100, raw)));
 
             Qt.callLater(root.updateOpenRazerDevices);
@@ -266,9 +283,18 @@ Item {
             if (!root.deviceData[id])
                 return;
 
-            if (data["exit code"] !== 0 || !(data.stdout || "").trim())
+            if (data["exit code"] !== 0)
                 return;
-            root.deviceData[id].charging = DeviceUtils.unwrapVariant(data.stdout) === "true";
+            let charging;
+            try {
+                charging = GVariant.parseReply(data.stdout);
+                if (typeof charging !== "boolean")
+                    throw new Error("expected a boolean");
+            } catch (error) {
+                console.warn(i18n("BatteryWatch: unreadable OpenRazer reply (%1)", error.message));
+                return;
+            }
+            root.deviceData[id].charging = charging;
 
             Qt.callLater(root.updateOpenRazerDevices);
         }
@@ -297,10 +323,18 @@ Item {
             if (data["exit code"] !== 0 || (data.stderr || "").trim().length > 0) {
                 return;
             }
-            const value = (DeviceUtils.scanStrings(DeviceUtils.unwrapVariant(data.stdout))[0] || "");
-            if (value.length === 0) {
+            let value;
+            try {
+                value = GVariant.parseReply(data.stdout);
+                if (typeof value !== "string")
+                    throw new Error("expected a string");
+            } catch (error) {
+                console.warn(i18n("BatteryWatch: unreadable OpenRazer reply (%1)", error.message));
                 return;
             }
+            if (value.length === 0)
+                return;
+
             if (src.includes("misc.getDeviceName")) {
                 root.deviceData[id].name = value;
             } else if (src.includes("misc.getDeviceType")) {
