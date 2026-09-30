@@ -73,8 +73,10 @@ const SEED = () => ({
     fetchDeviceData() {}, refreshBattery() {}, fetchNameAndType() {}, fetchPowerInfo() {}
 });
 
-function fire(handler, { reply, src, seed = SEED(), code = 0, stderr = '' }) {
-    const root = Object.assign(SEED(), seed);
+// Pass `root` to keep one provider state across replies, so a handler that
+// damages it is visible to the next call.
+function fire(handler, { reply, src, seed = SEED(), code = 0, stderr = '', root = null }) {
+    root = root || Object.assign(SEED(), seed);
     const warnings = [];
     const i18n = (s, a) => s.replace('%1', a === undefined ? '' : a);
     let scheduled = 0;
@@ -92,6 +94,13 @@ function fire(handler, { reply, src, seed = SEED(), code = 0, stderr = '' }) {
     console.warn = realWarn;
     console.log = realLog;
     return { root, warnings, scheduled, threw };
+}
+
+// A reply the provider is meant to accept must not throw either.
+function fireOk(handler, options) {
+    const r = fire(handler, options);
+    assert.equal(r.threw, null, `unexpected throw: ${r.threw && r.threw.message}`);
+    return r;
 }
 
 // Replies that do not parse, and replies that parse into the wrong shape or
@@ -190,45 +199,45 @@ test('a refused reply never throws, never changes device data, never refreshes',
 });
 
 test('a valid reply is applied', () => {
-    let r = fire(handlerFor('KDE Connect device list'), { reply: "(['id1', 'id2'],)", src: SRC.kdeList, seed: { deviceData: {}, knownDevices: {} } });
+    let r = fireOk(handlerFor('KDE Connect device list'), { reply: "(['id1', 'id2'],)", src: SRC.kdeList, seed: { deviceData: {}, knownDevices: {} } });
     assert.deepEqual(Object.keys(r.root.knownDevices), ['id1', 'id2']);
 
-    r = fire(handlerFor('KDE Connect properties'), {
+    r = fireOk(handlerFor('KDE Connect properties'), {
         reply: `({'name': <"Bob's Phone">, 'type': <'phone'>,},)`, src: SRC.kdeId('id1'),
         seed: { deviceData: { id1: { name: '', type: '' } } }
     });
     assert.equal(r.root.deviceData.id1.name, "Bob's Phone");
     assert.equal(r.root.deviceData.id1.type, 'phone');
 
-    r = fire(handlerFor('KDE Connect battery'), {
+    r = fireOk(handlerFor('KDE Connect battery'), {
         reply: "({'charge': <75>, 'isCharging': <false>},)", src: SRC.kdeId('id1'),
         seed: { deviceData: { id1: { charge: -1, charging: true } } }
     });
     assert.equal(r.root.deviceData.id1.charge, 75);
     assert.equal(r.root.deviceData.id1.charging, false);
 
-    r = fire(handlerFor('OpenRazer device list'), { reply: "(['AAA', 'BBB'],)", src: SRC.razerList, seed: { deviceData: {}, knownDevices: {} } });
+    r = fireOk(handlerFor('OpenRazer device list'), { reply: "(['AAA', 'BBB'],)", src: SRC.razerList, seed: { deviceData: {}, knownDevices: {} } });
     assert.deepEqual(Object.keys(r.root.knownDevices), ['AAA', 'BBB']);
 
-    r = fire(handlerFor('OpenRazer battery'), { reply: '(85.0,)', src: SRC.razerId('AAA', 'misc.getBattery'), seed: { deviceData: { AAA: { battery: 0 } } } });
+    r = fireOk(handlerFor('OpenRazer battery'), { reply: '(85.0,)', src: SRC.razerId('AAA', 'misc.getBattery'), seed: { deviceData: { AAA: { battery: 0 } } } });
     assert.equal(r.root.deviceData.AAA.battery, 85);
 
-    r = fire(handlerFor('OpenRazer charging'), { reply: '(true,)', src: SRC.razerId('AAA', 'misc.getCharging'), seed: { deviceData: { AAA: { charging: false } } } });
+    r = fireOk(handlerFor('OpenRazer charging'), { reply: '(true,)', src: SRC.razerId('AAA', 'misc.getCharging'), seed: { deviceData: { AAA: { charging: false } } } });
     assert.equal(r.root.deviceData.AAA.charging, true);
 
-    r = fire(handlerFor('OpenRazer details'), { reply: `(<"Razer Viper's Pro">,)`, src: SRC.razerId('AAA', 'misc.getDeviceName'), seed: { deviceData: { AAA: { name: '' } } } });
+    r = fireOk(handlerFor('OpenRazer details'), { reply: `(<"Razer Viper's Pro">,)`, src: SRC.razerId('AAA', 'misc.getDeviceName'), seed: { deviceData: { AAA: { name: '' } } } });
     assert.equal(r.root.deviceData.AAA.name, "Razer Viper's Pro");
 });
 
 test('a missing property keeps its previous value', () => {
-    let r = fire(handlerFor('KDE Connect properties'), {
+    let r = fireOk(handlerFor('KDE Connect properties'), {
         reply: "({'name': <'Renamed'>,},)", src: SRC.kdeId('AAA'),
         seed: { deviceData: { AAA: { name: 'Kept', type: 'phone' } } }
     });
     assert.equal(r.root.deviceData.AAA.name, 'Renamed');
     assert.equal(r.root.deviceData.AAA.type, 'phone');
 
-    r = fire(handlerFor('KDE Connect battery'), {
+    r = fireOk(handlerFor('KDE Connect battery'), {
         reply: "({'isCharging': <true>,},)", src: SRC.kdeId('AAA'),
         seed: { deviceData: { AAA: { charge: 42, charging: false } } }
     });
@@ -237,20 +246,38 @@ test('a missing property keeps its previous value', () => {
 });
 
 test('an empty device list disconnects the devices', () => {
-    const r = fire(handlerFor('OpenRazer device list'), { reply: '(@as [],)', src: SRC.razerList });
+    const r = fireOk(handlerFor('OpenRazer device list'), { reply: '(@as [],)', src: SRC.razerList });
     assert.deepEqual(Object.keys(r.root.knownDevices), []);
     assert.deepEqual(Object.keys(r.root.deviceData), []);
     assert.equal(r.scheduled, 1);
 });
 
-test('a refused device list does not stop the poll after it', () => {
-    const handler = handlerFor('OpenRazer device list');
-    fire(handler, { reply: '', src: SRC.razerList });
-    fire(handler, { reply: "([['AAA', 'BBB']],)", src: SRC.razerList });
-    const r = fire(handler, { reply: "(['AAA'],)", src: SRC.razerList });
-    assert.deepEqual(Object.keys(r.root.knownDevices), ['AAA']);
-    assert.deepEqual(Object.keys(r.root.deviceData), ['AAA']);
-    assert.equal(r.scheduled, 1);
+test('a refused device list leaves polling enabled and does not stop the next poll', () => {
+    for (const [name, enabled] of [
+        ['KDE Connect device list', 'kdeConnectEnabled'],
+        ['OpenRazer device list', 'razerEnabled']
+    ]) {
+        const handler = handlerFor(name);
+        const src = SRC_FOR[name]();
+        const root = Object.assign(SEED(), { knownDevices: { AAA: true, BBB: true } });
+
+        // One state, carried across every reply, so a handler that leaves
+        // polling disabled or the daemon flagged is caught here.
+        for (const bad of ['', "([['AAA', 'BBB']],)", 'nonsense']) {
+            const r = fire(handler, { reply: bad, src, root });
+            assert.equal(r.threw, null, `${name} threw on ${JSON.stringify(bad)}`);
+            assert.equal(r.root[enabled], true, `${name} disabled polling on ${JSON.stringify(bad)}`);
+            assert.equal(r.root.daemonUnavailable, false, `${name} flagged the daemon on ${JSON.stringify(bad)}`);
+            assert.deepEqual(Object.keys(r.root.knownDevices), ['AAA', 'BBB'], `${name} pruned devices on ${JSON.stringify(bad)}`);
+        }
+
+        const r = fire(handler, { reply: "(['AAA'],)", src, root });
+        assert.equal(r.threw, null, `${name} threw on the valid reply`);
+        assert.equal(r.root[enabled], true, `${name} disabled polling on the valid reply`);
+        assert.deepEqual(Object.keys(r.root.knownDevices), ['AAA'], `${name} did not apply the valid reply`);
+        assert.deepEqual(Object.keys(r.root.deviceData), ['AAA'], `${name} did not prune the stale device`);
+        assert.equal(r.scheduled, 1);
+    }
 });
 
 test('a failed command is not reported as an unreadable reply', () => {
@@ -264,7 +291,7 @@ test('a failed command is not reported as an unreadable reply', () => {
 });
 
 test('an OpenRazer device without a battery is dropped', () => {
-    const r = fire(handlerFor('OpenRazer battery'), {
+    const r = fireOk(handlerFor('OpenRazer battery'), {
         reply: '', src: SRC.razerId('AAA', 'misc.getBattery'),
         seed: { deviceData: { AAA: { battery: 42 } } }, code: 1, stderr: 'Error UnknownMethod misc.getBattery'
     });
@@ -275,7 +302,7 @@ test('an OpenRazer device without a battery is dropped', () => {
 test('unpairing refreshes without reading a reply', () => {
     const handler = byTag(kde, 'Qt.callLater(root.refresh)');
     assert.equal(handler.readsReply, false);
-    const r = fire(handler, { reply: '', src: '/usr/bin/gdbus call --session -d org.kde.kdeconnect' });
+    const r = fireOk(handler, { reply: '', src: '/usr/bin/gdbus call --session -d org.kde.kdeconnect' });
     assert.equal(r.scheduled, 1);
     assert.deepEqual(r.warnings, []);
 });
