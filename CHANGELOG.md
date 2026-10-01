@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Appearance page does not open** — the tab came up empty instead of showing the font and colour settings (issue #52). The font family combo box assigned to `ComboBox.currentValue`, a property Qt only made writable in 6.10, so on Qt 6.9 and older (Plasma 6.0–6.5) the assignment is a QML compile error and the whole page fails to load. The saved font is now selected by index instead, which works on every Qt 6
+- **Choosing a font family silently reverted to "System default"** — the combo box wrote to the config whenever its value changed, including the change caused by filling its own list, so merely opening the Appearance page overwrote the saved font. The config is now written only when the user actually picks a font, and a font that is no longer installed falls back to "System default" rather than leaving the combo box blank
+
 ## [0.3.2] - 2026-09-28
 
 ### Added

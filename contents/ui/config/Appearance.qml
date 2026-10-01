@@ -47,30 +47,26 @@ KCMUtils.SimpleKCM {
         readonly property int boxWidth: Kirigami.Units.gridUnit * 3
         readonly property int boxHeight: Kirigami.Units.gridUnit * 1.5
 
-        // Fetches fonts
-        ListModel {
-            id: fontsModel
-
-            Component.onCompleted: {
-                const systemFont = Kirigami.Theme.defaultFont.family;
-                const fonts = Qt.fontFamilies();
-                const arr = [
-                    {
-                        // Empty value keeps sys default font
-                        text: i18n("System Default (%1)", systemFont),
-                        value: ""
-                    }
-                ];
-
-                for (let i = 0, fontCount = fonts.length; i < fontCount; ++i) {
-                    arr.push({
-                        text: fonts[i],
-                        value: fonts[i]
-                    });
+        // Fonts offered by the combo box
+        property var fontList: {
+            const systemFont = Kirigami.Theme.defaultFont.family;
+            const fonts = Qt.fontFamilies();
+            const list = [
+                {
+                    // Empty value keeps sys default font
+                    text: i18n("System Default (%1)", systemFont),
+                    value: ""
                 }
+            ];
 
-                append(arr);
+            for (let i = 0, fontCount = fonts.length; i < fontCount; ++i) {
+                list.push({
+                    text: fonts[i],
+                    value: fonts[i]
+                });
             }
+
+            return list;
         }
 
         Kirigami.Separator {
@@ -86,17 +82,20 @@ KCMUtils.SimpleKCM {
 
             QQC2.ComboBox {
                 id: fontFamily
-                model: fontsModel
+                model: page.fontList
                 textRole: "text"
                 valueRole: "value"
-                currentValue: page.cfg_fontFamily
 
                 QQL.Layout.fillWidth: true
 
-                // Does not autosync -> updat explicitly on change
-                onCurrentValueChanged: {
-                    page.cfg_fontFamily = currentValue;
+                // currentValue is read-only before Qt 6.10 -> restore by index
+                Component.onCompleted: {
+                    const index = indexOfValue(page.cfg_fontFamily);
+                    currentIndex = index >= 0 ? index : 0;
                 }
+
+                // Does not autosync -> updat only on user selection
+                onActivated: page.cfg_fontFamily = currentValue
             }
 
             QQC2.ToolButton {
