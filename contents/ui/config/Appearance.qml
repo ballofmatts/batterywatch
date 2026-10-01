@@ -47,8 +47,10 @@ KCMUtils.SimpleKCM {
         readonly property int boxWidth: Kirigami.Units.gridUnit * 3
         readonly property int boxHeight: Kirigami.Units.gridUnit * 1.5
 
-        // Fonts offered by the combo box
-        property var fontList: {
+        // Fonts offered by the combo box, filled once by the combo box below
+        property var fontList: []
+
+        function buildFontList() {
             const systemFont = Kirigami.Theme.defaultFont.family;
             const fonts = Qt.fontFamilies();
             const list = [
@@ -88,8 +90,11 @@ KCMUtils.SimpleKCM {
 
                 QQL.Layout.fillWidth: true
 
-                // currentValue is read-only before Qt 6.10 -> restore by index
+                // Fills the list before selecting: currentValue is read-only
+                // before Qt 6.10, so the saved font is restored by index
                 Component.onCompleted: {
+                    page.fontList = page.buildFontList();
+
                     const index = indexOfValue(page.cfg_fontFamily);
                     currentIndex = index >= 0 ? index : 0;
                 }
