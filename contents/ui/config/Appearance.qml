@@ -90,17 +90,29 @@ KCMUtils.SimpleKCM {
 
                 QQL.Layout.fillWidth: true
 
+                // Falls back to "System default" for a family that is not installed
+                function selectFamily(family) {
+                    const index = indexOfValue(family);
+                    currentIndex = index >= 0 ? index : 0;
+                }
+
                 // Fills the list before selecting: currentValue is read-only
                 // before Qt 6.10, so the saved font is restored by index
                 Component.onCompleted: {
                     page.fontList = page.buildFontList();
-
-                    const index = indexOfValue(page.cfg_fontFamily);
-                    currentIndex = index >= 0 ? index : 0;
+                    selectFamily(page.cfg_fontFamily);
                 }
 
-                // Does not autosync -> updat only on user selection
+                // Does not autosync -> update only on user selection
                 onActivated: page.cfg_fontFamily = currentValue
+
+                // Follows the KCM when it resets or restores the configuration
+                Connections {
+                    target: page
+                    function onCfg_fontFamilyChanged() {
+                        fontFamily.selectFamily(page.cfg_fontFamily);
+                    }
+                }
             }
 
             QQC2.ToolButton {
