@@ -8,7 +8,7 @@
 ### Added
 - **Solaar support** — battery percentage, charging state and device type of Logitech HID++ devices via [Solaar](https://github.com/pwr-Solaar/Solaar)'s own library: everything Solaar supports — Unifying/Bolt/Lightspeed/Centurion receivers, wired and Bluetooth devices, headsets. Bluetooth devices get the disconnect action even when UPower does not see them; devices that are offline, asleep or without a battery are not shown (stateless polling, default 10s). Requires Solaar installed (distro package, pip or pipx); without it the integration stays quiet. Devices needing hidraw permission get the same lock icon + "Copy command" flow as the HID provider
 
-## [0.3.2] - 2026-09-28
+## [0.3.2] - 2026-10-02
 
 ### Added
 - **Keychron M5 support** — new request-response HID schema (0xB3:06 request / 0xB4 reply) reads the M5's battery over the vendor interface; works both wireless (Ultra-Link 8K dongle) and wired (USB-C); correct charging decode
@@ -20,6 +20,8 @@
 - **Stateless HID polling** — the helper reports only a current reading each 5s poll, so charging state updates promptly and devices that stop answering (asleep, or a wired mouse's idle dongle) drop immediately instead of showing stale entries
 
 ### Fixed
+- **Appearance page does not open** — the tab came up empty instead of showing the font and colour settings (issue #52, reported by @TheSpawnMan). The font family combo box assigned to `ComboBox.currentValue`, a property Qt only made writable in 6.10, so on Qt 6.9 and older the assignment is a QML compile error and the whole page fails to load. The saved font is now selected by index instead, which works on every Qt 6
+- **Choosing a font family silently reverted to "System default"** — the combo box wrote to the config whenever its value changed, including the change caused by filling its own list, so merely opening the Appearance page overwrote the saved font. The config is now written only when the user actually picks a font, a font that is no longer installed falls back to "System default" rather than leaving the combo box blank, and the selection follows the config again if the Appearance settings are reset
 - **G733 battery not reported** — accept long HID++ battery replies for Logitech headsets, addressing the response-format mismatch identified in the G733 descriptor from issue #2. Hardware confirmation pending. Replies are matched to the request that asked for them (device index, feature index and function/software ID) and a HID++ 2.0 error frame is reported — with its code — instead of being decoded as a bogus voltage
 - **Debug output for troubleshooting** — `--debug` now logs the selected node and identity, the exact request bytes, every received packet with the reason it was rejected, and timeouts, on stderr only (stdout stays valid JSON)
 - **Razer devices not detected** — the OpenRazer provider now talks to `openrazer-daemon` through `gdbus` instead of `qdbus` (issue #50). Qt6 renamed the binary to `qdbus6`, so on systems that don't ship the Qt5 `qdbus` (Fedora, NixOS, Arch/CachyOS without `qt5-tools`) every call failed and the widget showed no Razer devices at all. `gdbus` ships with glib2, which Plasma already depends on, and needs no Qt startup per call
@@ -33,6 +35,7 @@
 - @StarPepe — on-device testing and verification of the M5 support
 - @LookforFPS — ROG Azoth battery support (wired USB, 2.4 GHz dongle and OMNI receiver), reverse-engineered on hardware
 - @CorneliusKluge — issue #2 on-device diagnostics: the hidraw report descriptor that identified the G733's long-report response as the cause of the missing battery reading
+- @TheSpawnMan — issue #52 report of the blank Appearance page (Qt 6.8.2)
 
 ## [0.3.1] - 2026-07-01
 
