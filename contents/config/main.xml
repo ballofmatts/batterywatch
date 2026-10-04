@@ -104,6 +104,12 @@
   </group>
 
   <!-- Integrations -->
+  <group name="UPower">
+    <entry name="enableUPowerIntegration" type="Bool">
+      <default>true</default>
+    </entry>
+  </group>
+
   <group name="OpenLinkHub">
     <entry name="enableOpenLinkHubIntegration" type="Bool">
       <default>true</default>

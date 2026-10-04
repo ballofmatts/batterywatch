@@ -1,5 +1,6 @@
 import QtQuick 2.15
 import org.kde.plasma.plasma5support 2.0 as P5Support
+import org.kde.plasma.plasmoid 2.0
 import "../DeviceUtils.js" as DeviceUtils
 
 // UPower device provider
@@ -7,6 +8,7 @@ Item {
     id: root
     visible: false
     
+    property bool upowerEnabled: Plasmoid.configuration.enableUPowerIntegration
     property var devices: []
     
     readonly property int wiredType: 0
@@ -22,6 +24,8 @@ Item {
     })
     
     function refresh() {
+        if (!root.upowerEnabled)
+            return
         listSource.connectSource("upower -e")
         root.devices.forEach(d => {
             if (d.objectPath) {
@@ -29,6 +33,19 @@ Item {
                 detailsSource.connectSource("upower -i " + d.objectPath)
             }
         })
+    }
+
+    onUpowerEnabledChanged: {
+        if (root.upowerEnabled) {
+            root.refresh()
+            return
+        }
+        listSource.disconnectSource("upower -e")
+        root.devices.forEach(d => {
+            if (d.objectPath)
+                detailsSource.disconnectSource("upower -i " + d.objectPath)
+        })
+        root.devices = []
     }
     
     // Parse UPower text output into device object
@@ -166,6 +183,10 @@ Item {
         
         onNewData: (sourceName, data) => {
             disconnectSource(sourceName)
+            if (!root.upowerEnabled) {
+                root.devices = []
+                return
+            }
             
             var lines = data["stdout"].split("\n")
             var foundPaths = []
@@ -195,7 +216,7 @@ Item {
             }
         }
         
-        Component.onCompleted: connectSource("upower -e")
+        Component.onCompleted: if (root.upowerEnabled) connectSource("upower -e")
     }
     
     P5Support.DataSource {
@@ -205,6 +226,10 @@ Item {
         interval: 10000
 
         onNewData: (sourceName, data) => {
+            if (!root.upowerEnabled) {
+                root.devices = []
+                return
+            }
             var objectPath = sourceName.split(" ").pop()
             var info = parseUPowerOutput(data["stdout"], objectPath)
             
@@ -231,7 +256,7 @@ Item {
     
     Timer {
         interval: 2000
-        running: true
+        running: root.upowerEnabled
         repeat: true
         onTriggered: listSource.connectSource("upower -e")
     }

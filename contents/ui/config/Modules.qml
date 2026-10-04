@@ -7,6 +7,7 @@ import org.kde.kcmutils as KCMUtils
 KCMUtils.SimpleKCM {
     id: root
 
+    property alias cfg_enableUPowerIntegration: enableUPowerIntegration.checked
     property alias cfg_enableOpenLinkHubIntegration: enableOpenLinkHubIntegration.checked
     property alias cfg_openLinkHubApiPort: openLinkHubApiPort.value
 
@@ -27,6 +28,19 @@ KCMUtils.SimpleKCM {
 
         // anchors.left: parent.left
         // anchors.right: parent.right
+
+        Item {
+            Kirigami.FormData.isSection: true
+            Kirigami.FormData.label: i18n("UPower Integration")
+        }
+
+        QQL.RowLayout {
+            Kirigami.FormData.label: i18n("Enable")
+
+            QQC2.CheckBox {
+                id: enableUPowerIntegration
+            }
+        }
 
         Item {
             Kirigami.FormData.isSection: true
