@@ -64,7 +64,6 @@ class DeviceType(Enum):
 class DeviceVariant(NamedTuple):
     pid:         int         # Product ID
     iface:       int | None  # Interface
-    usage_page:  int | None = None  # Report-descriptor usage page of the battery node
     source:      InputStreamSchema | RequestSchema | None = None  # Optional schema overriding the device default
 
 class DataPos(NamedTuple):
@@ -97,15 +96,10 @@ class RequestSchema(NamedTuple):
     request:      bytes                           # Packet to send before reading; device replies with battery report
     timeout:      float = REQUEST_TIMEOUT_SEC     # Max wait for the reply; devices answer in milliseconds
     reply_prefix: bytes | None = None             # Expected reply prefix; None keeps the common report-ID + command echo check
-    # Protocol-specific check: None if the packet answers our request, else why not
-    validate_reply: Callable[[bytes], str | None] | None = None
 
     def rejection_reason(self, buf) -> str | None:
-        # both this check and the protocol-specific one index into the packet
         if len(buf) < 2:
             return f"{len(buf)}-byte packet is too short to be a reply"
-        if self.validate_reply is not None:
-            return self.validate_reply(buf)
         if self.reply_prefix is not None:
             if len(buf) < len(self.reply_prefix) or buf[:len(self.reply_prefix)] != self.reply_prefix:
                 return f"expected prefix {hexbuf(self.reply_prefix)}, got {hexbuf(buf)}"
@@ -160,20 +154,6 @@ def interpret(schema, buffers):
     return {"percentage": percentage, "charging": charging}
 
 
-# Voltage (mV) -> percentage, linear interpolation over a sorted-by-percentage
-# curve of (percent, millivolt) breakpoints (descending mV). Used by the
-# Logitech HID++ headset family, which reports only a raw battery voltage.
-def _voltage_percentage(voltage_mv, curve):
-    for (hi_pct, hi_mv), (lo_pct, lo_mv) in zip(curve, curve[1:]):
-        if voltage_mv >= hi_mv:
-            return hi_pct
-        if voltage_mv >= lo_mv:
-            span = hi_mv - lo_mv
-            fraction = (voltage_mv - lo_mv) / span if span > 0 else 0
-            return round(lo_pct + (hi_pct - lo_pct) * fraction)
-    return curve[-1][0]
-
-
 # ══════════════════════════════════════════════════════════════════════════
 # devices - the registry of known/supported devices (pure data)
 # ══════════════════════════════════════════════════════════════════════════
@@ -189,126 +169,9 @@ class Device(NamedTuple):
 # iface = None means that any interface contains battery data
 
 
-# ── Logitech headset battery voltage protocol ───────────────────────────────
-# Logitech headsets report a raw battery voltage over HID++ 2.0: write a 20-byte
-# long message (report 0x11, e.g. 11 ff 08 0a), read the long reply; only the
-# feature command + mV->% curve differ per model. HID++ 2.0 defines both formats
-# (0x10 short, 0x11 long); we use the long one, as headsetcontrol does. The
-# G733's descriptor (issue #2) declares 85 11 and no 0x10, and hid-generic
-# cannot deliver an undeclared report - but no reply has been captured yet.
-# Commands, PIDs and curves from headsetcontrol (GPL-3.0): logitech_g{533,535,
-# pro,633_g933_935}.hpp + protocols/logitech_calibrations.hpp; frame layout per
-# Logitech/cpg-docs hidpp20 and the kernel's hid-logitech-hidpp. Battery node =
-# report-descriptor usage page 0xff43 (G535: consumer page 0x0c, pins interface 3).
-# Status (third-party sources only - unfortunately, I don't have the real hardware to
-# verify these myself): G733 0x0AB5/0x0AFE, G533, G535, G933, G935 and
-# G PRO X follow from Solaar captures/device lists; G733 v3 0x0B1F,
-# G PRO 0x0AA7 and G PRO X v0 0x0AAA are protocol-shared extrapolations.
-# G PRO X 2 excluded: Solaar lists it as 0x0AF7 on the "Centurion transport",
-# a different protocol family.
-G633_CURVE = ((100, 4100), (80, 3950), (60, 3850), (40, 3750), (20, 3650), (10, 3500), (5, 3300), (0, 3150))
-G533_CURVE = ((100, 4200), (50, 3850), (30, 3790), (20, 3750), (5, 3680), (0, 3330))
-G535_CURVE = ((100, 4175), (50, 3817), (30, 3766), (20, 3730), (5, 3664), (0, 3310))
-GPRO_CURVE = ((100, 4150), (50, 3830), (30, 3780), (20, 3740), (5, 3670), (0, 3320))
-
 # parse() result: plausible-looking but not a valid battery frame (e.g. an
 # unrelated report on the same interface) - discard and keep waiting.
 KEEP_READING = object()
-
-# Long report, 20 bytes (HID++ 2.0 also defines a 7-byte short 0x10)
-HIDPP_LONG  = 0x11
-# Bytes needed before byte 6 (the charge state) can be read at all
-HIDPP_BATTERY_LEN = 7
-# An error frame carries its code in the last byte, so 6 is the floor for one
-HIDPP_ERROR_LEN = 6
-# A headset pack is a single Li-ion cell (4.2 V nominal), so nothing above this
-# can be its voltage
-HIDPP_MAX_MILLIVOLTS = 4600
-# "0xff is reserved for corded devices and receivers" - the device index we send
-HIDPP_REPLY_ADDRESS = 0xFF
-# Feature index 0xff marks an error frame, code at byte 5. Only one echoing our
-# own feature/function is ours to report (as in the kernel's hidpp_match_error);
-# a foreign 0xff is not a voltage, but its meaning is not ours to guess.
-HIDPP_ERROR_FEATURE = 0xFF
-# HID++ 2.0 error codes (Logitech/cpg-docs hidpp20, "HID++2.0 error codes")
-HIDPP_ERRORS = {0: "NoError", 1: "Unknown", 2: "InvalidArgument", 3: "OutOfRange",
-                4: "HWError", 5: "Logitech internal", 6: "INVALID_FEATURE_INDEX",
-                7: "INVALID_FUNCTION_ID", 8: "Busy", 9: "Unsupported"}
-
-
-def _logitech_reply_check(request):
-    """Accepts only the HID++ reply that answers this headset's battery request.
-
-    Returns None when the packet is that reply, else the reason it was rejected.
-    """
-    def check(buf):
-        if not buf:
-            return "empty packet"
-        if buf[0] != HIDPP_LONG:
-            return f"report id {buf[0]:#04x} is not {HIDPP_LONG:#04x}"
-        if len(buf) < HIDPP_ERROR_LEN:
-            return f"{len(buf)}-byte packet is too short for a HID++ reply"
-
-        # bytes 1-3 echo the request, including the software ID that separates
-        # replies meant for other applications (Logitech/cpg-docs hidpp20)
-        if buf[1] != request[1]:
-            return f"device index {buf[1]:#04x} does not echo the requested {request[1]:#04x}"
-        if buf[2] == HIDPP_ERROR_FEATURE:
-            # an error frame's echo sits one byte later than the request's
-            if buf[3] == request[2] and buf[4] == request[3]:
-                code = buf[5]
-                return (f"HID++ 2.0 error reply answering our request: code {code} "
-                        f"({HIDPP_ERRORS.get(code, 'unassigned')})")
-            return (f"HID++ error marker 0xff for another feature/function "
-                    f"({buf[3]:#04x} {buf[4]:#04x}, code {buf[5]}) - not an answer "
-                    f"to this request, not a battery reply")
-        if buf[2] != request[2]:
-            return f"feature index {buf[2]:#04x} is not {request[2]:#04x}"
-        if buf[3] != request[3]:
-            return f"function/software id {buf[3]:#04x} is not {request[3]:#04x}"
-
-        if len(buf) < HIDPP_BATTERY_LEN:
-            return f"{len(buf)} bytes is too short for the charge state (byte 6)"
-        return None
-    return check
-
-
-def _logitech_voltage_parse(curve):
-    # [4..5] = voltage big-endian, [6] = charge state (0x03 charging), the layout
-    # HeadsetControl reads. The 0xff guard is unreachable (the validator rejects
-    # it first) and only keeps bytes 4-5 from ever being read as a voltage.
-    def parse(buffers):
-        buf = buffers.get(HIDPP_LONG)
-        if buf is None or len(buf) < HIDPP_BATTERY_LEN:
-            return KEEP_READING  # nothing parsable: keep waiting for a real reply
-        if buf[2] == HIDPP_ERROR_FEATURE:
-            return None  # never a voltage
-        voltage_mv = (buf[4] << 8) | buf[5]
-        if not curve[-1][1] <= voltage_mv <= HIDPP_MAX_MILLIVOLTS:
-            return KEEP_READING  # outside any calibrated range: not the battery frame
-        return {"percentage": _voltage_percentage(voltage_mv, curve),
-                "charging": buf[6] == 0x03}
-    return parse
-
-
-def _logitech_headset(name, cmd, curve, *pids, usage_page=0xFF43, iface=None):
-    """A single Logitech headset; returns the ready-made Device."""
-    request = bytes([HIDPP_LONG, HIDPP_REPLY_ADDRESS, cmd[0], cmd[1]]) + b"\x00" * 16
-    return Device(
-        name=name,
-        device_type=DeviceType.HEADSET,
-        vid=0x046D,
-        variants=tuple(DeviceVariant(pid, iface, usage_page) for pid in pids),
-        source=RequestSchema(
-            charge=DataPos(HIDPP_LONG, 4),
-            charge_range=None,
-            status=ChargingStates(pos=DataPos(HIDPP_LONG, 6), states={0x01: False, 0x03: True}),
-            request=request,
-            timeout=REQUEST_TIMEOUT_SEC,
-            validate_reply=_logitech_reply_check(request),
-        ),
-        parse=_logitech_voltage_parse(curve),
-    )
 
 
 def _azoth_serial_resolver(path, vid, pid, fields):
@@ -431,15 +294,8 @@ KNOWN_DEVICES = [
         parse=None,
         serial_resolver=_azoth_serial_resolver,
     ),
-    # ── Logitech headsets ──────────────────────────────────────────────────
-    _logitech_headset("Logitech G733/G933/G935", (0x08, 0x0A), G633_CURVE, 0x0A5B, 0x0A87, 0x0AB5, 0x0AFE, 0x0B1F),
-    _logitech_headset("Logitech G533", (0x07, 0x01), G533_CURVE, 0x0A66),
-    _logitech_headset("Logitech G535", (0x05, 0x0D), G535_CURVE, 0x0AC4, usage_page=None, iface=3),
-    _logitech_headset("Logitech G PRO Series", (0x06, 0x0D), GPRO_CURVE, 0x0AA7, 0x0AAA, 0x0ABA),
 ]
 
-# PIDs whose variants select the battery node by report-descriptor usage page
-_USAGE_PAGE_PIDS = {variant.pid for dev in KNOWN_DEVICES for variant in dev.variants if variant.usage_page is not None}
 
 class FoundDevice(NamedTuple):
     devpath: str
@@ -516,58 +372,13 @@ def parse_uevent(path):
 
     return vid, pid, iface, fields, phys
 
-# Walks a raw HID report descriptor for its usage pages. Item byte: bits 0-1
-# size (0/1/2/4), bits 2-3 type, bits 4-7 tag. Usage Page = Global/tag 0,
-# Usage = Local/tag 0; 1-byte usages inherit the current page, 2-byte usages
-# carry their own in the high byte.
-def _parse_usage_pages(data):
-    pages = set()
-    page = 0
-    i = 0
-    n = len(data)
-    while i < n:
-        b = data[i]
-        i += 1
-        if b == 0xFE:  # long item: skip its length byte + payload
-            length = data[i] if i < n else 0
-            i += 1 + length
-            continue
-        item_len = (0, 1, 2, 4)[b & 0x03]
-        if i + item_len > n:
-            break
-        value = data[i:i + item_len]
-        i += item_len
-        btype = (b >> 2) & 0x03
-        btag = (b >> 4) & 0x0F
-        if btype == 1 and btag == 0:  # Global / Usage Page
-            page = int.from_bytes(value, "little")
-            pages.add(page)
-        elif btype == 2 and btag == 0:  # Local / Usage
-            usage = int.from_bytes(value, "little")
-            pages.add(page if item_len < 2 else usage >> 8)
-    return pages
-
-# Usage pages declared by the hidraw node's report descriptor; empty on failure
-def hid_usage_pages(path):
-    try:
-        with open(path, "rb") as f:
-            return _parse_usage_pages(f.read())
-    except OSError:
-        return set()
-
 # Returns the matching Device and variant for a given vid/pid/iface, or None.
-# A variant may constrain the interface, the descriptor usage page, or both.
-def match_device(vid, pid, iface, usage_pages=None):
+def match_device(vid, pid, iface):
     for dev in KNOWN_DEVICES:
         if vid != dev.vid:
             continue
         for variant in dev.variants:
             if pid != variant.pid:
-                continue
-            # usage_page variants select the node by its report-descriptor page
-            if variant.usage_page is not None:
-                if usage_pages and variant.usage_page in usage_pages:
-                    return dev, variant
                 continue
             # iface = None in a variant means any interface contains batt data
             if variant.iface is not None and iface != variant.iface:
@@ -649,15 +460,8 @@ def find_devices():
             continue
         vid, pid, iface, fields, phys = parsed
 
-        usage_pages = hid_usage_pages(f"/sys/class/hidraw/{name}/device/report_descriptor") if pid in _USAGE_PAGE_PIDS else set()
-        matched = match_device(vid, pid, iface, usage_pages)
+        matched = match_device(vid, pid, iface)
         if matched is None:
-            if pid in _USAGE_PAGE_PIDS:
-                # The usage page is what selects the battery node among a
-                # device's interfaces, so a miss here is worth explaining
-                debug(f"{name}: {vid:04x}:{pid:04x} (iface {iface}) has usage pages "
-                      f"{sorted(hex(p) for p in usage_pages) or 'none'}, "
-                      f"none matching a known battery node")
             continue
         desc, variant = matched
 
@@ -678,8 +482,7 @@ def find_devices():
             serial = phys or name
 
         devpath = f"/dev/{name}"
-        debug(f"{devpath}: reading {desc.name} {vid:04x}:{pid:04x} "
-              f"(iface {iface}, usage pages {[hex(p) for p in sorted(usage_pages)] or 'not read'})")
+        debug(f"{devpath}: reading {desc.name} {vid:04x}:{pid:04x} (iface {iface})")
         devices.append(FoundDevice(devpath, serial, desc, pid, variant.source or desc.source))
     return devices
 
@@ -819,7 +622,6 @@ def read_status(dev):
 _SIMULATE_DEVICES = [
     ("Keychron M5", "sim-keychron-m5", 0x3434, "d028", "mouse", 88, False),
     ("Steam Controller 2", "sim-steam-controller-2", 0x28DE, "1304", "gamepad", 85, True),
-    ("Logitech G733", "sim-g733", 0x046D, "0ab5", "audio-headset", 64, True),
 ]
 
 def _simulate():
