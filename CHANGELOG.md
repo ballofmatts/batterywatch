@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Removed
+- **Direct Logitech headset support in the HID provider** — the HID++ implementation for Logitech G533, G535, G PRO, G733, G933 and G935 headsets is gone. It was never verified on real hardware. These headsets are still covered, through the Solaar provider, which reads them via Solaar's own library and is verified against real hardware.
+
 ### Fixed
 - **A Logitech mouse behind a Unifying receiver was listed twice** — UPower reports such a device with the kernel's `HID_UNIQ` (`f9-0d-4f-0c`) in its serial field while Solaar reports the HID++ unit serial of the very same receiver unit (`F90D4F0C`); the two providers' entries were compared literally, so one mouse showed up from each. Devices are now matched on a canonical serial, which also folds the spellings of a Bluetooth MAC (`cb:6a:b2:6c:73:47` vs `CB:6A:B2:6C:73:47`). The serial itself is untouched for display, and the hidden-device list is matched on the same canonical key, so a hidden mouse stays hidden when another provider reports it in a different spelling; a named serial such as `4066-C535` is deliberately left alone rather than folded into `4066C535`, so two unrelated devices cannot collapse into one
 - **Bluetooth Logitech batteries had no disconnect action** — UPowerProvider classified Bluetooth only from the device's native-path, but for kernel `hidpp` batteries over Bluetooth the native-path is just `hidpp_battery_N` while the MAC sits in the serial field. A fully colon-separated MAC serial now marks the device as Bluetooth, restoring the disconnect button; USB-receiver/cable transports report a dash-separated uniq or a raw HID++ serial and cannot match (their classification stays wireless)
