@@ -94,14 +94,32 @@ class InputStreamSchema(NamedTuple):
     def poll_timeout(self) -> float:
         return TIMEOUT_SEC
 
+# One step in an ordered RequestSchema exchange.  The generic executor knows
+# only the semantic key and report ID; protocol-specific correlation belongs
+# in validate_reply (for example, Razer's echoed property byte).
+class RequestTransaction(NamedTuple):
+    key:            str
+    request:        bytes
+    report_id:      int
+    validate_reply: Callable[[bytes], str | None]
+
+    def rejection_reason(self, buf) -> str | None:
+        if not buf:
+            return "empty packet"
+        if buf[0] != self.report_id:
+            return f"report id {buf[0]:#04x} is not {self.report_id:#04x}"
+        return self.validate_reply(buf)
+
 # Device responds to a request packet with a battery report (e.g. Keychron M5)
 class RequestSchema(NamedTuple):
     charge:       DataPos
     charge_range: tuple[int, int] | None
     status:       DataPos | ChargingStates | None
-    request:      bytes                           # Packet to send before reading; device replies with battery report
+    request:      bytes = b""                     # Single request packet; unused when transactions is set
     timeout:      float = REQUEST_TIMEOUT_SEC     # Max wait for the reply; devices answer in milliseconds
     reply_prefix: bytes | None = None             # Expected reply prefix; None keeps the common report-ID + command echo check
+    # Optional ordered exchanges. Empty preserves the legacy one-request path.
+    transactions: tuple[RequestTransaction, ...] = ()
 
     def rejection_reason(self, buf) -> str | None:
         if len(buf) < 2:
@@ -185,6 +203,56 @@ def _azoth_serial_resolver(path, vid, pid, fields):
     return (usb_serial(path, vid, pid)
             or printable_serial(fields.get("HID_UNIQ", ""))
             or "unknown-hid")
+
+
+# ── Razer Barracuda X Chroma property protocol ────────────────────────────
+RAZER_REPORT_ID = 0x02
+RAZER_REPORT_LEN = 64
+RAZER_VALUE_BYTE = 13
+
+# Captures verify the checksum asymmetry: host requests XOR bytes 0..61,
+# including the report ID; device replies XOR bytes 1..61, excluding it.
+def _razer_get_request(prop):
+    request = bytearray(RAZER_REPORT_LEN)
+    request[:11] = bytes.fromhex("02 00 60 00 00 00 04 00 00 80") + bytes([prop])
+    checksum = 0
+    for byte in request[:62]:
+        checksum ^= byte
+    request[62] = checksum
+    return bytes(request)
+
+def _razer_reply_check(prop):
+    expected = bytes.fromhex("02 02 60 00 00 00 05 00 80 80") + bytes([prop, 0x01, 0x01])
+
+    def check(buf):
+        if len(buf) != RAZER_REPORT_LEN:
+            return f"expected {RAZER_REPORT_LEN}-byte Razer reply, got {len(buf)} bytes"
+        if buf[:13] != expected:
+            return (f"expected Razer property reply {hexbuf(expected)}, "
+                    f"got {hexbuf(buf[:13])}")
+
+        checksum = 0
+        for byte in buf[1:62]:
+            checksum ^= byte
+        if buf[62] != checksum:
+            return f"Razer reply checksum {buf[62]:#04x} is not expected {checksum:#04x}"
+
+        value = buf[RAZER_VALUE_BYTE]
+        if prop == 0x21 and value > 100:
+            return f"Razer battery value {value} is outside 0..100"
+        if prop == 0x2A and value not in (0, 1):
+            return f"Razer charging value {value} is not 0 or 1"
+        return None
+    return check
+
+def _razer_parse(replies):
+    return {
+        "percentage": replies["battery"][RAZER_VALUE_BYTE],
+        "charging": replies["charging"][RAZER_VALUE_BYTE] == 0x01,
+    }
+
+RAZER_BATTERY_REQUEST = _razer_get_request(0x21)
+RAZER_CHARGING_REQUEST = _razer_get_request(0x2A)
 
 
 KNOWN_DEVICES = [
@@ -300,6 +368,33 @@ KNOWN_DEVICES = [
         parse=None,
         serial_resolver=_azoth_serial_resolver,
     ),
+    Device(
+        name="Razer Barracuda X Chroma",
+        device_type=DeviceType.HEADSET,
+        vid=0x1532,
+        variants=(DeviceVariant(0x0574, None, 0xFF14),),
+        source=RequestSchema(
+            charge=DataPos(RAZER_REPORT_ID, RAZER_VALUE_BYTE),
+            charge_range=None,
+            status=None,
+            timeout=REQUEST_TIMEOUT_SEC,
+            transactions=(
+                RequestTransaction(
+                    key="battery",
+                    request=RAZER_BATTERY_REQUEST,
+                    report_id=RAZER_REPORT_ID,
+                    validate_reply=_razer_reply_check(0x21),
+                ),
+                RequestTransaction(
+                    key="charging",
+                    request=RAZER_CHARGING_REQUEST,
+                    report_id=RAZER_REPORT_ID,
+                    validate_reply=_razer_reply_check(0x2A),
+                ),
+            ),
+        ),
+        parse=_razer_parse,
+    ),
 ]
 
 # PIDs whose variants select the battery node by report-descriptor usage page.
@@ -331,6 +426,10 @@ def printable_serial(value):
             value = value[:index]
             break
     return value or None
+
+def meaningful_hid_uniq(value):
+    """Reject missing and all-zero HID unique ids without changing other values."""
+    return value if value and any(char != "0" for char in value) else None
 
 # Returns the USB device serial for this HID node when its parent exposes one.
 # Some devices append malformed bytes to their string descriptor, so retain
@@ -540,7 +639,7 @@ def find_devices():
 
         serial = (desc.serial_resolver(f"/sys/class/hidraw/{name}/device/uevent", vid, pid, fields)
                   if desc.serial_resolver is not None
-                  else fields.get("HID_UNIQ", "") or "unknown-hid")
+                  else meaningful_hid_uniq(fields.get("HID_UNIQ", "")) or "unknown-hid")
 
         # One entry per physical device: iface=None matches every interface, so
         # skip ones already taken (phys is shared across a device's interfaces)
@@ -586,7 +685,7 @@ def open_device(dev, schema):
               f"{'O_RDWR' if needs_write else 'O_RDONLY'}) failed: {e}")
         return None
 
-    if needs_write:
+    if needs_write and not schema.transactions:
         try:
             debug(f"{dev.desc.name}: write {hexbuf(schema.request)} ({len(schema.request)} bytes)")
             os.write(fd, schema.request)
@@ -597,11 +696,90 @@ def open_device(dev, schema):
 
     return fd
 
+# Runs a short ordered sequence of request/reply exchanges on one open node.
+# Every step must succeed before parse() sees any replies, so callers never get
+# a partial battery state.
+def read_transaction_status_hw(dev, schema):
+    fd = open_device(dev, schema)
+    if fd is None:
+        return None
+
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        replies = {}
+
+        for transaction in schema.transactions:
+            try:
+                debug(f"{dev.desc.name}: write {hexbuf(transaction.request)} "
+                      f"({len(transaction.request)} bytes) [{transaction.key}]")
+                written = os.write(fd, transaction.request)
+            except OSError as e:
+                debug(f"{dev.desc.name}: write of {hexbuf(transaction.request)} failed: {e}")
+                return None
+            if written != len(transaction.request):
+                debug(f"{dev.desc.name}: short write for {transaction.key}: "
+                      f"{written} of {len(transaction.request)} bytes")
+                return None
+
+            # Timeout applies per transaction; a full sequence may take N * timeout.
+            deadline = time.monotonic() + schema.poll_timeout()
+            read_size = max(HID_BUFFER_SIZE, len(transaction.request))
+            while True:
+                timeout_ms = int((deadline - time.monotonic()) * 1000)
+                if timeout_ms <= 0:
+                    debug(f"{dev.desc.name}: no accepted reply for {transaction.key} "
+                          f"within {schema.poll_timeout():g}s ({dev.devpath})")
+                    return None
+
+                events = poller.poll(timeout_ms)
+                if not events:
+                    debug(f"{dev.desc.name}: no accepted reply for {transaction.key} "
+                          f"within {schema.poll_timeout():g}s ({dev.devpath})")
+                    return None
+
+                _, revents = events[0]
+                if revents & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                    debug(f"{dev.desc.name}: device error or disconnect "
+                          f"(poll flags {revents:#x})")
+                    return None
+                if not (revents & select.POLLIN):
+                    return None
+
+                try:
+                    buf = os.read(fd, read_size)
+                except OSError as e:
+                    debug(f"{dev.desc.name}: read failed: {e}")
+                    return None
+                if not buf:
+                    continue
+
+                debug(f"{dev.desc.name}: received {hexbuf(buf)} ({len(buf)} bytes) "
+                      f"[{transaction.key}]")
+                reason = transaction.rejection_reason(buf)
+                if reason is not None:
+                    debug(f"{dev.desc.name}: ignored: {reason}")
+                    continue
+
+                replies[transaction.key] = buf
+                break
+
+        if dev.desc.parse is None:
+            return None
+        result = dev.desc.parse(replies)
+        debug(f"{dev.desc.name}: reading {result}")
+        return result
+    finally:
+        os.close(fd)
+
 # Reads a device's power status: waits for a report the schema accepts or for
 # the schema's timeout. O_NONBLOCK + poll() makes it sleep in kernel with 0 CPU
 # utilisation. Returns status dict {"percentage", "charging"} or None.
 def read_status_hw(dev):
     schema = dev.source
+    if isinstance(schema, RequestSchema) and schema.transactions:
+        return read_transaction_status_hw(dev, schema)
+
     needed = needed_reports(schema)
     # Most devices use 64-byte reports.  Some request-response devices, such
     # as the ROG Azoth, use a 65-byte report including report ID, so read at

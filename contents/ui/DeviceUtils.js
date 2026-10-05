@@ -46,8 +46,10 @@ function getIconForType(deviceType) {
         case "tablet":
             return "tablet"
         case "headphones":
+        case "audio-headphones":
             return "audio-headphones"
         case "headset":
+        case "audio-headset":
             return "audio-headset"
         case "monitor":
         case "display":
