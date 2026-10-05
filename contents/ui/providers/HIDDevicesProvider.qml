@@ -76,6 +76,7 @@ Item {
             .map(d => ({
                 name: d.name || i18n("Unknown Device"),
                 serial: d.serial || d.name,
+                identityIsFallback: d.identityIsFallback === true,
                 percentage: d.percentage,
                 charging: d.charging === true,
                 blocked: d.blocked === true,
@@ -97,6 +98,7 @@ Item {
             const changed = result.some(n => {
                 const o = oldMap[n.serial]
                 return !o || o.percentage !== n.percentage || o.charging !== n.charging
+                    || o.identityIsFallback !== n.identityIsFallback
             })
             if (!changed) return
         }

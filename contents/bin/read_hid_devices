@@ -7,6 +7,7 @@ reads their battery over hidraw and prints JSON for HIDDevicesProvider.qml:
   {"name", "serial", "percentage", "charging", "deviceType"} for a readable
   device, or {"name", "serial", "blocked": true, "vid", "pid",
   "unblock_command", "deviceType"} for one that needs a udev rule.
+  identityIsFallback marks a serial used only as an internal device identity.
 
 Organized in sections mirroring the concerns:
   schema  - report schemas + generic decoder (pure)
@@ -408,6 +409,7 @@ class FoundDevice(NamedTuple):
     desc:    Device
     pid:     int       # Product ID that actually matched (from sysfs)
     source:  InputStreamSchema | RequestSchema
+    identity_is_fallback: bool = False
 
 # ══════════════════════════════════════════════════════════════════════════
 # hid - sysfs discovery + hidraw I/O
@@ -425,6 +427,10 @@ def printable_serial(value):
             value = value[:index]
             break
     return value or None
+
+def meaningful_hid_uniq(value):
+    """Reject missing and all-zero HID unique ids without changing other values."""
+    return value if value and any(char != "0" for char in value) else None
 
 # Returns the USB device serial for this HID node when its parent exposes one.
 # Some devices append malformed bytes to their string descriptor, so retain
@@ -634,7 +640,7 @@ def find_devices():
 
         serial = (desc.serial_resolver(f"/sys/class/hidraw/{name}/device/uevent", vid, pid, fields)
                   if desc.serial_resolver is not None
-                  else fields.get("HID_UNIQ", "") or "unknown-hid")
+                  else meaningful_hid_uniq(fields.get("HID_UNIQ", "")) or "unknown-hid")
 
         # One entry per physical device: iface=None matches every interface, so
         # skip ones already taken (phys is shared across a device's interfaces)
@@ -645,13 +651,15 @@ def find_devices():
 
         # Fall back to the physical path when the device reports no serial, so
         # multiple identical dongles get distinct ids.
-        if serial == "unknown-hid":
+        identity_is_fallback = serial == "unknown-hid"
+        if identity_is_fallback:
             serial = phys or name
 
         devpath = f"/dev/{name}"
         debug(f"{devpath}: reading {desc.name} {vid:04x}:{pid:04x} "
               f"(iface {iface}, usage pages {[hex(p) for p in sorted(usage_pages)] or 'not read'})")
-        devices.append(FoundDevice(devpath, serial, desc, pid, variant.source or desc.source))
+        devices.append(FoundDevice(devpath, serial, desc, pid, variant.source or desc.source,
+                                   identity_is_fallback))
     return devices
 
 # True when the device is present but its hidraw node can't be opened for the
@@ -890,11 +898,13 @@ def _device_entry(dev):
     status = read_status(dev)
     if status is not None:
         return {"name": dev.desc.name, "serial": dev.serial,
+                "identityIsFallback": dev.identity_is_fallback,
                 "percentage": status["percentage"], "charging": status["charging"],
                 "deviceType": dev.desc.device_type.value}
     if is_blocked(dev):
         # Present but no permission to open: offer the exact command to authorize it
         return {"name": dev.desc.name, "serial": dev.serial, "blocked": True,
+                "identityIsFallback": dev.identity_is_fallback,
                 "vid": f"{dev.desc.vid:04x}", "pid": f"{dev.pid:04x}",
                 "unblock_command": udev_unblock_command(dev.desc.vid),
                 "deviceType": dev.desc.device_type.value}

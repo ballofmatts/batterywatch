@@ -23,7 +23,7 @@ for suite in "${suites[@]}"; do
 done
 
 # The parser and provider suites run under node and live beside the UI code.
-js_suites=(../../ui/GVariant.test.cjs ../../ui/providers.test.cjs)
+js_suites=(../../ui/GVariant.test.cjs ../../ui/providers.test.cjs ../../ui/DeviceUtils.test.cjs)
 if [ "$#" -eq 0 ]; then
     if ! command -v node >/dev/null 2>&1; then
         for suite in "${js_suites[@]}"; do
