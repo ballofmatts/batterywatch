@@ -64,7 +64,9 @@ Item {
             bluetoothAddress: "",
             source: "upower",
             batteries: [],
-            model: ""
+            model: "",
+            batteryLevel: "",
+            percentageIgnored: false
         }
 
         var deviceType = ""
@@ -84,8 +86,22 @@ Item {
                 device.name = device.model
             }
             else if (trimmedLine.indexOf("percentage:") !== -1) {
-                var percentStr = trimmedLine.split(":")[1].trim().replace("%", "")
-                device.percentage = parseInt(percentStr)
+                var percentStr = trimmedLine.split(":")[1].trim()
+                // UPower appends "(should be ignored)" when it is serving a
+                // reading it does not trust - a stale or absent battery.
+                // Strip it before parsing, and remember that it was there.
+                device.percentageIgnored = percentStr.indexOf("should be ignored") !== -1
+                device.percentage = parseInt(percentStr.replace("%", "").replace("(should be ignored)", ""))
+            }
+            else if (trimmedLine.indexOf("battery-level:") !== -1) {
+                // A HID++ battery node stays registered as long as the *receiver*
+                // is powered, so a mouse that is switched off keeps appearing in
+                // `upower -e`. UPower then reports battery-level "unknown" with
+                // "0% (should be ignored)" - a parse of which yields 0 and passes
+                // the percentage gate below, pinning the device in the list at 0%.
+                // battery-level is the signal that distinguishes that stale node
+                // from a real battery that is genuinely empty ("empty").
+                device.batteryLevel = trimmedLine.split(":")[1].trim()
             }
             else if (trimmedLine.indexOf("state:") !== -1) {
                 device.charging = trimmedLine.split(":")[1].trim() === "charging"
@@ -232,7 +248,22 @@ Item {
             }
             var objectPath = sourceName.split(" ").pop()
             var info = parseUPowerOutput(data["stdout"], objectPath)
-            
+
+            // A receiver-backed HID++ battery stays enumerated while the device behind it
+            // is off, so `upower -e` cannot drop it - only its detail reply can.
+            // UPower then serves a stale reading flagged "(should be ignored)"
+            // alongside battery-level "unknown". Requiring BOTH keeps this
+            // conservative: a device with no usable battery reading has nothing
+            // to show, while a genuinely empty battery reports "empty" and a
+            // trusted percentage and is kept.
+            if (info && info.batteryLevel === "unknown" && info.percentageIgnored) {
+                var without = root.devices.filter(d => d.objectPath !== objectPath)
+                if (without.length !== root.devices.length) {
+                    root.devices = without.sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+                }
+                return
+            }
+
             if (info && info.connectionType !== root.wiredType && info.percentage >= 0) {
                 // Update or add device
                 var updated = false

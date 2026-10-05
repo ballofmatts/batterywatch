@@ -123,6 +123,36 @@ const UPOWER_DONGLE_HIDPP = ['  native-path:          hidpp_battery_0', '  model
 const UPOWER_BLUEZ = ['  native-path:          bluez:0C_1A_0F_2E_91_62',
     '  serial:               0C-1A-0F-2E-91-62', '  headphones',
     '    percentage:          70%', '    state:               discharging'].join('\n');
+// Captured verbatim from a real M305 that had just been switched off. The
+// node survives in `upower -e` because the Unifying receiver is still powered.
+const UPOWER_HIDPP_OFF = ['  native-path:          (null)', '  power supply:         no',
+    '  updated:              Thu 01 Jan 1970 02:00:00 (1791156071 seconds ago)',
+    '  has history:          no', '  has statistics:       no', '  unknown',
+    '    warning-level:       unknown', '    battery-level:       unknown',
+    "    percentage:          0% (should be ignored)",
+    "    icon-name:           '(null)'"].join('\n');
+// The same device while AWAKE, captured verbatim. Note that it still carries
+// "(should be ignored)" - UPower flags hidpp percentages as uncalibrated even
+// for a working device (it reads 55% where Solaar reads 50%), which is why the
+// suffix on its own must never be used to hide a device.
+const UPOWER_HIDPP_ON = ['  native-path:          hidpp_battery_5', '  model:                Logitech M305',
+    '  serial:               f9-0d-4f-0c', '  power supply:         no', '  has history:          yes',
+    '  has statistics:       yes', '  mouse',
+    '    present:             yes', '    rechargeable:        yes',
+    '    state:               discharging', '    warning-level:       none',
+    '    battery-level:       normal', "    percentage:          55% (should be ignored)",
+    "    icon-name:           'battery-low-symbolic'"].join('\n');
+// The other mouse on this machine, awake and fully charged, captured verbatim.
+// It is Bluetooth (a colon-MAC serial), which is why it disappears on its own
+// when switched off. It also carries "(should be ignored)" at a healthy 100% -
+// proof that the suffix says nothing about a device being off.
+const UPOWER_MXMASTER = ['  native-path:          hidpp_battery_7', '  model:                MX Master 3',
+    '  serial:               cb:6a:b2:6c:73:47', '  power supply:         no',
+    '  has history:          yes', '  has statistics:       yes', '  mouse',
+    '    present:             yes', '    rechargeable:        yes',
+    '    state:               fully-charged', '    warning-level:       none',
+    '    battery-level:       full', "    percentage:          100% (should be ignored)",
+    "    icon-name:           'battery-full-charged-symbolic'"].join('\n');
 
 // The command line each DataSource is started with; the handlers read the
 // device id out of it and ignore a src that does not carry one.
@@ -419,6 +449,148 @@ test('bluez devices classify Bluetooth via the native-path as before', () => {
     assert.equal(d.connectionType, 2);
     assert.equal(d.bluetoothAddress, '0C:1A:0F:2E:91:62');
     assert.equal(d.type, 'headphones');
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// Stale HID++ nodes: a device that is switched off keeps its battery node
+// while the receiver is powered, so the list has to drop it on battery-level
+// ══════════════════════════════════════════════════════════════════════════
+
+test('a switched-off receiver device parses as unknown with a misleading 0%', () => {
+    // The trap this guards: "0% (should be ignored)" parses to 0, and the
+    // provider's percentage >= 0 gate accepts 0, so the device used to sit in
+    // the list at 0% forever. The two flags below are what reveal it is off.
+    const d = parseUpower(UPOWER_HIDPP_OFF);
+    assert.equal(d.batteryLevel, 'unknown');
+    assert.equal(d.percentageIgnored, true);
+    assert.equal(d.percentage, 0, 'documents the misleading parse this fixes');
+    assert.equal(d.charging, false);
+});
+
+test('a stale cached percentage is still recognised as untrustworthy', () => {
+    // The real symptom was not a stable 0%: with history enabled UPower serves
+    // the last awake reading, so the device was pinned at 50% while off. The
+    // stale reading must be caught whatever number it carries.
+    const stale = UPOWER_HIDPP_OFF.replace('0% (should be ignored)', '50% (should be ignored)')
+        .replace('  native-path:          (null)', '  native-path:          hidpp_battery_5')
+        .replace('  has history:          no', '  has history:          yes');
+    const d = parseUpower(stale);
+    assert.equal(d.percentage, 50, 'the stale number is what UPower reports');
+    assert.equal(d.batteryLevel, 'unknown');
+    assert.equal(d.percentageIgnored, true, 'but it is flagged as untrustworthy');
+});
+
+test('a real battery level is parsed and is not mistaken for unknown', () => {
+    // Regression: a genuinely empty battery reports "empty", not "unknown",
+    // and a trusted percentage with no "(should be ignored)" suffix, so the
+    // fix above must not hide real flat batteries.
+    const out = UPOWER_DONGLE_HIDPP + '\n    battery-level:       low';
+    const d = parseUpower(out);
+    assert.equal(d.batteryLevel, 'low');
+    assert.equal(d.percentageIgnored, false);
+    assert.equal(d.percentage, 89);
+});
+
+test('an unknown level without the ignored marker is kept', () => {
+    // Deliberately conservative: only the combination of both signals means
+    // "there is no battery reading", so an odd device is never silently lost.
+    const d = parseUpower(UPOWER_DONGLE_HIDPP + '\n    battery-level:       unknown');
+    assert.equal(d.batteryLevel, 'unknown');
+    assert.equal(d.percentageIgnored, false);
+    assert.equal(d.percentage, 89, 'still shown');
+});
+
+test('upower removes a device once its battery level goes unknown', () => {
+    // The receiver keeps the node enumerated, so the list reply cannot drop
+    // it - only the detail reply reveals the device is off.
+    const path = '/org/freedesktop/UPower/devices/battery_hidpp_battery_5';
+    const live = parseUpower(UPOWER_DONGLE_HIDPP, path);
+    const root = upowerRoot(true, [live, { objectPath: '/other', name: 'Keep me' }]);
+    const r = fireOk(upowerDetails, { reply: UPOWER_HIDPP_OFF, src: `/usr/bin/upower -i ${path}`, root, parse: parseUpower });
+    assert.deepEqual(r.root.devices.map(d => d.name), ['Keep me'],
+        'the switched-off device was not removed');
+});
+
+test('upower still adds a device that was unknown and came back', () => {
+    // It must reappear once it wakes, so the removal is not a one-way door.
+    const path = '/org/freedesktop/UPower/devices/battery_hidpp_battery_5';
+    const root = upowerRoot(true, []);
+    const r = fireOk(upowerDetails, { reply: UPOWER_DONGLE_HIDPP, src: `/usr/bin/upower -i ${path}`, root, parse: parseUpower });
+    assert.equal(r.root.devices.length, 1);
+    assert.equal(r.root.devices[0].name, 'Wireless Mouse M305');
+});
+
+test('removing a device leaves its detail source polling so it can return', () => {
+    // No `sources`: a handler that disconnected the poll here would be unable
+    // to notice the device coming back.
+    const path = '/org/freedesktop/UPower/devices/battery_hidpp_battery_5';
+    const root = upowerRoot(true, [parseUpower(UPOWER_DONGLE_HIDPP, path)]);
+    fireOk(upowerDetails, { reply: UPOWER_HIDPP_OFF, src: `/usr/bin/upower -i ${path}`, root, parse: parseUpower });
+    assert.deepEqual(root.devices, []);
+});
+
+test('the same device is kept while awake, though it is still marked ignored', () => {
+    // The regression that shaped the rule: real UPower output for a WORKING
+    // M305 also says "(should be ignored)". Filtering on that suffix alone
+    // would hide a live, discharging mouse. Only the pairing with
+    // battery-level "unknown" means the device is actually off.
+    const path = '/org/freedesktop/UPower/devices/battery_hidpp_battery_5';
+    const parsed = parseUpower(UPOWER_HIDPP_ON, '/x');
+    assert.equal(parsed.batteryLevel, 'normal');
+    assert.equal(parsed.percentageIgnored, true, 'the suffix is present even when awake');
+    const root = upowerRoot(true, []);
+    const r = fireOk(upowerDetails, { reply: UPOWER_HIDPP_ON, src: `/usr/bin/upower -i ${path}`, root, parse: parseUpower });
+    assert.equal(r.root.devices.length, 1, 'the awake device was hidden');
+    assert.equal(r.root.devices[0].percentage, 55);
+});
+
+test('off and on replies drive the same device in and out of the list', () => {
+    // End-to-end on the two real captures: switching the mouse off must remove
+    // it, switching it on must bring the very same device back.
+    const path = '/org/freedesktop/UPower/devices/battery_hidpp_battery_5';
+    const src = `/usr/bin/upower -i ${path}`;
+    const root = upowerRoot(true, []);
+
+    const on = fireOk(upowerDetails, { reply: UPOWER_HIDPP_ON, src, root, parse: parseUpower });
+    assert.equal(on.root.devices.length, 1);
+    assert.equal(on.root.devices[0].name, 'Logitech M305');
+
+    const off = fireOk(upowerDetails, { reply: UPOWER_HIDPP_OFF, src, root, parse: parseUpower });
+    assert.deepEqual(off.root.devices.map(d => d.name), [], 'stayed in the list after power-off');
+
+    const back = fireOk(upowerDetails, { reply: UPOWER_HIDPP_ON, src, root, parse: parseUpower });
+    assert.equal(back.root.devices.length, 1, 'did not come back after power-on');
+    assert.equal(back.root.devices[0].percentage, 55);
+});
+
+test('a healthy full-charge device marked ignored is still kept', () => {
+    // The second mouse on this machine, awake at 100%. It carries the same
+    // "(should be ignored)" suffix as the off M305, so any rule that dropped on
+    // the suffix alone would have hidden a fully charged mouse. This is the
+    // regression that pins the rule to battery-level.
+    const path = '/org/freedesktop/UPower/devices/battery_hidpp_battery_7';
+    const root = upowerRoot(true, []);
+    const r = fireOk(upowerDetails, { reply: UPOWER_MXMASTER, src: `/usr/bin/upower -i ${path}`, root, parse: parseUpower });
+    assert.equal(r.root.devices.length, 1, 'a full-charge device was hidden');
+    assert.equal(r.root.devices[0].percentage, 100);
+    assert.equal(r.root.devices[0].batteryLevel, 'full');
+    assert.equal(r.root.devices[0].percentageIgnored, true);
+    assert.equal(r.root.devices[0].connectionType, 2, 'still classified Bluetooth');
+    assert.equal(r.root.devices[0].bluetoothAddress, 'CB:6A:B2:6C:73:47');
+});
+
+test('only an unknown level is dropped, on both real mice', () => {
+    // Summary of the rule against every real reading captured from this
+    // machine: only the off M305 combines an unknown level with the marker.
+    const cases = [
+        ['M305 off', UPOWER_HIDPP_OFF, true],
+        ['M305 on', UPOWER_HIDPP_ON, false],
+        ['MX Master on', UPOWER_MXMASTER, false],
+    ];
+    for (const [label, out, dropped] of cases) {
+        const d = parseUpower(out);
+        assert.equal(d.batteryLevel === 'unknown' && d.percentageIgnored, dropped, label);
+    }
 });
 
 // ══════════════════════════════════════════════════════════════════════════
