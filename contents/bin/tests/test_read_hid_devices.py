@@ -424,12 +424,11 @@ def test_non_azoth_hid_uniq_is_not_resolved_or_sanitized():
     scenario["uevents"]["hidraw6"] = m5_uevent("hidraw6")[:-1] + "serial\x18\xbe\n"
     assert rhd.find_devices()[0].serial == "serial\x18\xbe"
 
-def test_missing_hid_uniq_marks_physical_identity_as_fallback():
+def test_missing_hid_uniq_exposes_the_physical_identity():
     install_m5_scenario()
     set_m5_reply(87)
     entry = rhd._device_entry(rhd.find_devices()[0])
     assert entry["serial"] == "usb-0000:00:14.0-11"
-    assert entry.get("identityIsFallback") is True
 
 def test_meaningful_hid_uniq_remains_displayable():
     install_m5_scenario()
@@ -437,7 +436,6 @@ def test_meaningful_hid_uniq_remains_displayable():
     scenario["uevents"]["hidraw6"] = m5_uevent("hidraw6")[:-1] + "SN000123\n"
     entry = rhd._device_entry(rhd.find_devices()[0])
     assert entry["serial"] == "SN000123"
-    assert entry.get("identityIsFallback") is False
 
 def test_reference_match():
     # Reference match (github.com/itayavra/batterywatch/issues/5)
@@ -683,11 +681,24 @@ def test_razer_real_captures_decode_after_two_ordered_requests():
     assert scenario["write_data"] == [RAZER_BATTERY_REQUEST, RAZER_CHARGING_REQUEST]
     assert scenario["read_sizes"] == [64, 64]
 
+def test_transactions_can_omit_the_single_request_without_an_extra_write():
+    install_razer_scenario()
+    dev = rhd.find_devices()[0]
+    schema = rhd.RequestSchema(
+        charge=rhd.DataPos(0x02, 13),
+        charge_range=None,
+        status=None,
+        transactions=dev.source.transactions,
+    )
+    assert rhd.read_status(dev._replace(source=schema)) == {
+        "percentage": 100, "charging": False
+    }
+    assert scenario["write_data"] == [RAZER_BATTERY_REQUEST, RAZER_CHARGING_REQUEST]
+
 def test_razer_all_zero_hid_uniq_uses_existing_physical_path_fallback():
     install_razer_scenario()
     entry = rhd._device_entry(rhd.find_devices()[0])
     assert entry["serial"] == "usb-0000:00:14.0-6.1.2"
-    assert entry.get("identityIsFallback") is True
 
 def test_razer_correlates_same_report_id_by_echoed_property():
     install_razer_scenario()
@@ -791,7 +802,6 @@ def test_razer_blocked_entry_uses_existing_request_schema_udev_path():
     assert rhd.is_blocked(dev) is True
     entry = rhd._device_entry(dev)
     assert entry["blocked"] is True
-    assert entry.get("identityIsFallback") is True
     assert entry["vid"] == "1532"
     assert entry["pid"] == "0574"
     assert 'ATTRS{idProduct}=="0574"' in rhd.udev_rule_for(0x1532)

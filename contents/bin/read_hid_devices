@@ -7,7 +7,6 @@ reads their battery over hidraw and prints JSON for HIDDevicesProvider.qml:
   {"name", "serial", "percentage", "charging", "deviceType"} for a readable
   device, or {"name", "serial", "blocked": true, "vid", "pid",
   "unblock_command", "deviceType"} for one that needs a udev rule.
-  identityIsFallback marks a serial used only as an internal device identity.
 
 Organized in sections mirroring the concerns:
   schema  - report schemas + generic decoder (pure)
@@ -116,7 +115,7 @@ class RequestSchema(NamedTuple):
     charge:       DataPos
     charge_range: tuple[int, int] | None
     status:       DataPos | ChargingStates | None
-    request:      bytes                           # Packet to send before reading; device replies with battery report
+    request:      bytes = b""                     # Single request packet; unused when transactions is set
     timeout:      float = REQUEST_TIMEOUT_SEC     # Max wait for the reply; devices answer in milliseconds
     reply_prefix: bytes | None = None             # Expected reply prefix; None keeps the common report-ID + command echo check
     # Optional ordered exchanges. Empty preserves the legacy one-request path.
@@ -211,6 +210,8 @@ RAZER_REPORT_ID = 0x02
 RAZER_REPORT_LEN = 64
 RAZER_VALUE_BYTE = 13
 
+# Captures verify the checksum asymmetry: host requests XOR bytes 0..61,
+# including the report ID; device replies XOR bytes 1..61, excluding it.
 def _razer_get_request(prop):
     request = bytearray(RAZER_REPORT_LEN)
     request[:11] = bytes.fromhex("02 00 60 00 00 00 04 00 00 80") + bytes([prop])
@@ -376,7 +377,6 @@ KNOWN_DEVICES = [
             charge=DataPos(RAZER_REPORT_ID, RAZER_VALUE_BYTE),
             charge_range=None,
             status=None,
-            request=b"",  # transactions are the authoritative request sequence
             timeout=REQUEST_TIMEOUT_SEC,
             transactions=(
                 RequestTransaction(
@@ -409,7 +409,6 @@ class FoundDevice(NamedTuple):
     desc:    Device
     pid:     int       # Product ID that actually matched (from sysfs)
     source:  InputStreamSchema | RequestSchema
-    identity_is_fallback: bool = False
 
 # ══════════════════════════════════════════════════════════════════════════
 # hid - sysfs discovery + hidraw I/O
@@ -651,15 +650,13 @@ def find_devices():
 
         # Fall back to the physical path when the device reports no serial, so
         # multiple identical dongles get distinct ids.
-        identity_is_fallback = serial == "unknown-hid"
-        if identity_is_fallback:
+        if serial == "unknown-hid":
             serial = phys or name
 
         devpath = f"/dev/{name}"
         debug(f"{devpath}: reading {desc.name} {vid:04x}:{pid:04x} "
               f"(iface {iface}, usage pages {[hex(p) for p in sorted(usage_pages)] or 'not read'})")
-        devices.append(FoundDevice(devpath, serial, desc, pid, variant.source or desc.source,
-                                   identity_is_fallback))
+        devices.append(FoundDevice(devpath, serial, desc, pid, variant.source or desc.source))
     return devices
 
 # True when the device is present but its hidraw node can't be opened for the
@@ -898,13 +895,11 @@ def _device_entry(dev):
     status = read_status(dev)
     if status is not None:
         return {"name": dev.desc.name, "serial": dev.serial,
-                "identityIsFallback": dev.identity_is_fallback,
                 "percentage": status["percentage"], "charging": status["charging"],
                 "deviceType": dev.desc.device_type.value}
     if is_blocked(dev):
         # Present but no permission to open: offer the exact command to authorize it
         return {"name": dev.desc.name, "serial": dev.serial, "blocked": True,
-                "identityIsFallback": dev.identity_is_fallback,
                 "vid": f"{dev.desc.vid:04x}", "pid": f"{dev.pid:04x}",
                 "unblock_command": udev_unblock_command(dev.desc.vid),
                 "deviceType": dev.desc.device_type.value}

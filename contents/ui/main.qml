@@ -513,7 +513,6 @@ PlasmoidItem {
                                         }
 
                                         PlasmaComponents.Label {
-                                            visible: device.blocked === true || device.identityIsFallback !== true
                                             text: device.blocked === true
                                                 ? i18n("Permission needed - run the command in a terminal")
                                                 : device.serial
