@@ -12,6 +12,8 @@ sysfs + hidraw devices and verifies every behavior the widget depends on:
   Azoth (ROG):    Wired, standard 2.4 GHz, and OMNI request-response
                   transports; their control-interface targeting, battery and
                   charging-state decode, blocked reporting, and udev rules.
+  Barracuda X Chroma (Razer): ordered battery + charging requests, strict
+                  reply correlation/validation, captured-packet decoding.
   SC2 (stream):   battery decode from stream report, charging state, no write.
 
 Written as plain pytest-style test_*() functions so they read like idiomatic
@@ -72,6 +74,31 @@ unpatched_usb_serial = rhd.usb_serial
 scenario = {"uevents": {}, "fake_devs": {}, "reply_fd": None, "reply_buf": bytearray(64),
             "reply_queue": [], "writes": [], "write_data": [], "reads": [], "read_sizes": [],
             "open_flags": [], "descriptors": {}, "descriptor_reads": 0}
+
+RAZER_BATTERY_REQUEST = bytes.fromhex(
+    "02 00 60 00 00 00 04 00 00 80 21 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 c7 00"
+)
+RAZER_BATTERY_REPLY = bytes.fromhex(
+    "02 02 60 00 00 00 05 00 80 80 21 01 01 64 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 22 00"
+)
+RAZER_CHARGING_REQUEST = bytes.fromhex(
+    "02 00 60 00 00 00 04 00 00 80 2a 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 cc 00"
+)
+RAZER_CHARGING_REPLY = bytes.fromhex(
+    "02 02 60 00 00 00 05 00 80 80 2a 01 01 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 "
+    "00 00 00 00 00 00 00 00 4d 00"
+)
 
 def m5_uevent(node, pid="0000D028", name="Keychron Keychron Ultra-Link 8K", iface=4):
     return (f"DRIVER=hid-generic\nHID_ID=0003:00003434:{pid}\n"
@@ -246,6 +273,27 @@ def vendor_device(usage_page=rhd.VENDOR_USAGE_PAGE, pid=_TEST_PID, vid=_TEST_VID
     finally:
         rhd.KNOWN_DEVICES.remove(dev)
         rhd._USAGE_PAGE_PIDS.discard(pid)
+
+def install_razer_scenario(with_blocked=False, usage_page=0xFF14):
+    scenario["uevents"] = {
+        "hidraw5": ("DRIVER=hid-generic\nHID_ID=0003:00001532:00000574\n"
+                    "HID_NAME=MediaTek Inc Razer Barracuda X Chroma\n"
+                    "HID_PHYS=usb-0000:00:14.0-6.1.2/input3\n"
+                    "HID_UNIQ=0000000000000000\n"),
+    }
+    scenario["fake_devs"] = {"/dev/hidraw5": 205}
+    scenario["deny"] = with_blocked
+    scenario["writes"] = []
+    scenario["write_data"] = []
+    scenario["reads"] = []
+    scenario["read_sizes"] = []
+    scenario["open_flags"] = []
+    scenario["reply_buf"] = bytearray(0)
+    scenario["reply_queue"] = [RAZER_BATTERY_REPLY, RAZER_CHARGING_REPLY]
+    scenario["reply_fd"] = 205
+    scenario["descriptors"] = ({"hidraw5": hid_descriptor(usage_page)}
+                               if usage_page is not None else {})
+    scenario["descriptor_reads"] = 0
 
 def set_m5_reply(byte20=87, report_id=0xB4, cmd=0x06):
     buf = bytearray(64)
@@ -596,6 +644,136 @@ def test_azoth_blocked_entry_and_udev_rule_cover_both_variants():
     assert 'ATTRS{idProduct}=="1a85"' in rule
     assert 'ATTRS{idProduct}=="1ace"' in rule
     assert rule.count('MODE="0660"') == 3
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Razer Barracuda X Chroma: ordered property requests on report 0x02
+# ══════════════════════════════════════════════════════════════════════════
+def test_razer_profile_uses_the_exact_captured_requests():
+    dev = next(dev for dev in rhd.KNOWN_DEVICES
+               if dev.name == "Razer Barracuda X Chroma")
+    assert dev.device_type == rhd.DeviceType.HEADSET
+    assert dev.variants == (rhd.DeviceVariant(0x0574, None, 0xFF14),)
+    assert [transaction.key for transaction in dev.source.transactions] == [
+        "battery", "charging"
+    ]
+    assert [transaction.request for transaction in dev.source.transactions] == [
+        RAZER_BATTERY_REQUEST, RAZER_CHARGING_REQUEST
+    ]
+
+def test_razer_real_captures_decode_after_two_ordered_requests():
+    install_razer_scenario()
+    dev = rhd.find_devices()[0]
+    assert rhd.read_status(dev) == {"percentage": 100, "charging": False}
+    assert scenario["write_data"] == [RAZER_BATTERY_REQUEST, RAZER_CHARGING_REQUEST]
+    assert scenario["read_sizes"] == [64, 64]
+
+def test_razer_correlates_same_report_id_by_echoed_property():
+    install_razer_scenario()
+    scenario["reply_queue"] = [
+        RAZER_CHARGING_REPLY,  # report 0x02, but not the requested property 0x21
+        RAZER_BATTERY_REPLY,
+        RAZER_CHARGING_REPLY,
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": False
+    }
+    assert len(scenario["reads"]) == 3
+    assert scenario["write_data"] == [RAZER_BATTERY_REQUEST, RAZER_CHARGING_REQUEST]
+
+def test_razer_correlates_property_reply_by_report_id_too():
+    install_razer_scenario()
+    wrong_report = bytearray(RAZER_BATTERY_REPLY)
+    wrong_report[0] = 0x07
+    scenario["reply_queue"] = [
+        bytes(wrong_report), RAZER_BATTERY_REPLY, RAZER_CHARGING_REPLY
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": False
+    }
+    assert len(scenario["reads"]) == 3
+
+def test_razer_rejects_bad_checksum_then_accepts_real_capture():
+    install_razer_scenario()
+    bad_checksum = bytearray(RAZER_BATTERY_REPLY)
+    bad_checksum[62] ^= 0x01
+    scenario["reply_queue"] = [
+        bytes(bad_checksum), RAZER_BATTERY_REPLY, RAZER_CHARGING_REPLY
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": False
+    }
+    assert len(scenario["reads"]) == 3
+
+def test_razer_rejects_truncated_and_malformed_property_replies():
+    install_razer_scenario()
+    bad_header = bytearray(RAZER_BATTERY_REPLY)
+    bad_header[11] = 0x00
+    scenario["reply_queue"] = [
+        RAZER_BATTERY_REPLY[:-1], bytes(bad_header),
+        RAZER_BATTERY_REPLY, RAZER_CHARGING_REPLY,
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": False
+    }
+    assert len(scenario["reads"]) == 4
+
+def test_razer_rejects_checksum_correct_out_of_range_values():
+    install_razer_scenario()
+    invalid_battery = bytearray(RAZER_BATTERY_REPLY)
+    invalid_battery[13] = 101
+    invalid_battery[62] = 0x23
+    invalid_charging = bytearray(RAZER_CHARGING_REPLY)
+    invalid_charging[13] = 2
+    invalid_charging[62] = 0x4F
+    scenario["reply_queue"] = [
+        bytes(invalid_battery), RAZER_BATTERY_REPLY,
+        bytes(invalid_charging), RAZER_CHARGING_REPLY,
+    ]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": False
+    }
+    assert len(scenario["reads"]) == 4
+
+def test_razer_charging_value_one_decodes_true():
+    install_razer_scenario()
+    charging = bytearray(RAZER_CHARGING_REPLY)
+    charging[13] = 1
+    charging[62] = 0x4C
+    scenario["reply_queue"] = [RAZER_BATTERY_REPLY, bytes(charging)]
+    assert rhd.read_status(rhd.find_devices()[0]) == {
+        "percentage": 100, "charging": True
+    }
+
+def test_razer_second_transaction_timeout_publishes_no_partial_state():
+    install_razer_scenario()
+    scenario["reply_queue"] = [RAZER_BATTERY_REPLY]
+    assert rhd.read_status(rhd.find_devices()[0]) is None
+    assert scenario["write_data"] == [RAZER_BATTERY_REQUEST, RAZER_CHARGING_REQUEST]
+
+def test_razer_first_transaction_timeout_does_not_send_second_request():
+    install_razer_scenario()
+    scenario["reply_queue"] = []
+    assert rhd.read_status(rhd.find_devices()[0]) is None
+    assert scenario["write_data"] == [RAZER_BATTERY_REQUEST]
+
+def test_razer_discovery_requires_vendor_usage_page_ff14():
+    install_razer_scenario()
+    assert [dev.devpath for dev in rhd.find_devices()] == ["/dev/hidraw5"]
+
+    install_razer_scenario(usage_page=0xFF13)
+    assert rhd.find_devices() == []
+
+def test_razer_blocked_entry_uses_existing_request_schema_udev_path():
+    install_razer_scenario(with_blocked=True)
+    dev = rhd.find_devices()[0]
+    assert rhd.is_blocked(dev) is True
+    entry = rhd._device_entry(dev)
+    assert entry["blocked"] is True
+    assert entry["vid"] == "1532"
+    assert entry["pid"] == "0574"
+    assert 'ATTRS{idProduct}=="0574"' in rhd.udev_rule_for(0x1532)
+    assert 'MODE="0660"' in rhd.udev_rule_for(0x1532)
 
 
 # ══════════════════════════════════════════════════════════════════════════
