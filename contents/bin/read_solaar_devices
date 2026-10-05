@@ -264,13 +264,15 @@ def device_entry(device):
     try:
         battery = device.battery()
         is_charging = bool(battery.charging()) if battery is not None else False
+        # lazy HID++ read; read inside the guard so a raise costs one device
+        raw_level = battery.level if battery is not None else None
     except Exception as error:
         debug(f"{name}: battery read failed ({error!r}), dropping")
         return None
-    if battery is None or battery.level is None:
+    if battery is None or raw_level is None:
         debug(f"{name}: no battery level, dropping")
         return None
-    level = percentage(battery.level)
+    level = percentage(raw_level)
     # kind/unitId/serial are lazy properties that do HID++ I/O on a freshly
     # created Device; read each defensively and independently, so a raise
     # costs one field, not the device - and never discards a value that

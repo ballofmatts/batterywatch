@@ -457,6 +457,48 @@ def test_collect_receiver_walk_failure_still_reports_others():
     assert [(e["name"], e["deviceType"]) for e in entries] == [("MX Keys S", "keyboard")]
 
 
+class _LazyLevelBattery:
+    """Battery whose lazy level read fails, like a HID++ timeout."""
+
+    def charging(self):
+        return False
+
+    @property
+    def level(self):
+        raise RuntimeError("HID++ read timeout on feature 0x1000")
+
+
+class _LazyLevelDevice(FakeDevice):
+    def battery(self):
+        return _LazyLevelBattery()
+
+
+def test_collect_lazy_level_failure_keeps_the_other_direct_devices():
+    # a raising lazy level read must not escape device_entry and empty the run
+    infos = [
+        types.SimpleNamespace(path="/dev/hidrawA", isDevice=True, centurion=False),
+        types.SimpleNamespace(path="/dev/hidrawB", isDevice=True, centurion=False),
+        types.SimpleNamespace(path="/dev/hidrawC", isDevice=True, centurion=False),
+    ]
+    first = FakeDevice(path="/dev/hidrawA", name="M305", serial="SER-A", level=55)
+    broken = _LazyLevelDevice(path="/dev/hidrawB", name="G733", serial="SER-B")
+    last = FakeDevice(path="/dev/hidrawC", name="MX Master 3", serial="SER-C", level=100)
+    entries = rsd.collect(make_modules([first, broken, last], infos))
+    assert [e["name"] for e in entries] == ["M305", "MX Master 3"]
+
+
+def test_collect_lazy_level_failure_keeps_the_rest_of_a_receiver_walk():
+    # same on the receiver path: the rest of that receiver's walk must survive
+    paired = [
+        FakeDevice(name="M305", serial="SER-P1", level=55),
+        _LazyLevelDevice(name="G733", serial="SER-P2"),
+        FakeDevice(name="MX Master 3", serial="SER-P3", level=100),
+    ]
+    infos = [types.SimpleNamespace(path="/dev/hidrecv", isDevice=False, centurion=False)]
+    entries = rsd.collect(make_modules([], infos, paired=paired))
+    assert [e["name"] for e in entries] == ["M305", "MX Master 3"]
+
+
 def test_collect_permission_error_is_a_blocked_entry():
     raise_work = PermissionError(13, "Permission denied")
     infos = [types.SimpleNamespace(path="/dev/hidrecv", isDevice=False, centurion=False)]

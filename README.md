@@ -32,7 +32,7 @@
 | **OpenRazer** | Razer peripherals via [OpenRazer](https://openrazer.github.io/) |
 | **KDE Connect** | Battery levels of paired KDE Connect devices (phones, tablets, etc), with easy unpair action |
 | **HID Devices** | Peripherals read directly via Linux HID (currently supports Steam Controller 2, Keychron M5, and ROG Azoth) |
-| **Solaar** | Logitech HID++ peripherals managed by [Solaar](https://github.com/pwr-Solaar/Solaar) - Unifying/Bolt/Lightspeed/Centurion receivers, wired and Bluetooth devices; requires Solaar installed (the widget reads batteries through Solaar's own library, so every device Solaar supports is covered) |
+| **Solaar** (experimental) | Logitech HID++ peripherals via [Solaar](https://github.com/pwr-Solaar/Solaar) - only tested on a few devices, so feedback is welcome |
 
 
 ## Installation
