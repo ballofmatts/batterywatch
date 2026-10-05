@@ -61,9 +61,15 @@ class DeviceType(Enum):
     HEADPHONES  = "audio-headphones"
     HEADSET     = "audio-headset"
 
+# usage_page sentinel: any vendor-defined page (0xff00-0xffff). Used when the
+# battery collection's exact page varies across a family, so only the range is
+# stable enough to match on.
+VENDOR_USAGE_PAGE = "vendor"
+
 class DeviceVariant(NamedTuple):
-    pid:         int         # Product ID
-    iface:       int | None  # Interface
+    pid:         int              # Product ID
+    iface:       int | None       # Interface
+    usage_page:  int | str | None = None  # Report-descriptor usage page of the battery node, or VENDOR_USAGE_PAGE
     source:      InputStreamSchema | RequestSchema | None = None  # Optional schema overriding the device default
 
 class DataPos(NamedTuple):
@@ -296,6 +302,11 @@ KNOWN_DEVICES = [
     ),
 ]
 
+# PIDs whose variants select the battery node by report-descriptor usage page.
+# Descriptors are only read for these: doing it for every hidraw node would
+# mean opening a file per interface on every poll.
+_USAGE_PAGE_PIDS = {variant.pid for dev in KNOWN_DEVICES for variant in dev.variants if variant.usage_page is not None}
+
 
 class FoundDevice(NamedTuple):
     devpath: str
@@ -372,13 +383,68 @@ def parse_uevent(path):
 
     return vid, pid, iface, fields, phys
 
+# Walks a raw HID report descriptor for its usage pages. Item byte: bits 0-1
+# size (0/1/2/4), bits 2-3 type (0 Main, 1 Global, 2 Local), bits 4-7 tag.
+# Usage Page = Global/tag 0, Usage = Local/tag 0. A Usage item is a usage ID
+# *within* the current Usage Page, so a 2-byte usage is still that page - not a
+# page number in its high byte. Collection boundaries are not tracked: the
+# result is a flat set of every page the node declares, which is all the page
+# test in match_device() needs.
+def _parse_usage_pages(data):
+    pages = set()
+    page = 0
+    i = 0
+    n = len(data)
+    while i < n:
+        b = data[i]
+        i += 1
+        if b == 0xFE:  # long item: skip its length byte + payload
+            length = data[i] if i < n else 0
+            i += 1 + length
+            continue
+        item_len = (0, 1, 2, 4)[b & 0x03]
+        if i + item_len > n:
+            break
+        value = data[i:i + item_len]
+        i += item_len
+        btype = (b >> 2) & 0x03
+        btag = (b >> 4) & 0x0F
+        if btype == 1 and btag == 0:  # Global / Usage Page
+            page = int.from_bytes(value, "little")
+            pages.add(page)
+        elif btype == 2 and btag == 0:  # Local / Usage
+            pages.add(page)
+    return pages
+
+# Usage pages declared by the hidraw node's report descriptor; empty on failure
+def hid_usage_pages(path):
+    try:
+        with open(path, "rb") as f:
+            return _parse_usage_pages(f.read())
+    except OSError:
+        return set()
+
 # Returns the matching Device and variant for a given vid/pid/iface, or None.
-def match_device(vid, pid, iface):
+# A variant may constrain the interface, the descriptor usage page, or both.
+def match_device(vid, pid, iface, usage_pages=None):
     for dev in KNOWN_DEVICES:
         if vid != dev.vid:
             continue
         for variant in dev.variants:
             if pid != variant.pid:
+                continue
+            # usage_page variants select the node by its report-descriptor page.
+            # Only reached once vid/pid already matched a registered variant, so
+            # a vendor-page match can never claim an unrelated device.
+            if variant.usage_page is not None:
+                if not usage_pages:
+                    continue
+                if variant.usage_page == VENDOR_USAGE_PAGE:
+                    # Exact vendor page differs per model, so match the range
+                    if any(page >= 0xFF00 for page in usage_pages):
+                        return dev, variant
+                elif variant.usage_page in usage_pages:
+                    return dev, variant
                 continue
             # iface = None in a variant means any interface contains batt data
             if variant.iface is not None and iface != variant.iface:
@@ -460,8 +526,15 @@ def find_devices():
             continue
         vid, pid, iface, fields, phys = parsed
 
-        matched = match_device(vid, pid, iface)
+        usage_pages = hid_usage_pages(f"/sys/class/hidraw/{name}/device/report_descriptor") if pid in _USAGE_PAGE_PIDS else set()
+        matched = match_device(vid, pid, iface, usage_pages)
         if matched is None:
+            if pid in _USAGE_PAGE_PIDS:
+                # The usage page is what selects the battery node among a
+                # device's interfaces, so a miss here is worth explaining
+                debug(f"{name}: {vid:04x}:{pid:04x} (iface {iface}) has usage pages "
+                      f"{sorted(hex(p) for p in usage_pages) or 'none'}, "
+                      f"none matching a known battery node")
             continue
         desc, variant = matched
 
@@ -482,7 +555,8 @@ def find_devices():
             serial = phys or name
 
         devpath = f"/dev/{name}"
-        debug(f"{devpath}: reading {desc.name} {vid:04x}:{pid:04x} (iface {iface})")
+        debug(f"{devpath}: reading {desc.name} {vid:04x}:{pid:04x} "
+              f"(iface {iface}, usage pages {[hex(p) for p in sorted(usage_pages)] or 'not read'})")
         devices.append(FoundDevice(devpath, serial, desc, pid, variant.source or desc.source))
     return devices
 

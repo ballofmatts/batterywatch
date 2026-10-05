@@ -71,7 +71,7 @@ unpatched_usb_serial = rhd.usb_serial
 # ══════════════════════════════════════════════════════════════════════════
 scenario = {"uevents": {}, "fake_devs": {}, "reply_fd": None, "reply_buf": bytearray(64),
             "reply_queue": [], "writes": [], "write_data": [], "reads": [], "read_sizes": [],
-            "open_flags": []}
+            "open_flags": [], "descriptors": {}, "descriptor_reads": 0}
 
 def m5_uevent(node, pid="0000D028", name="Keychron Keychron Ultra-Link 8K", iface=4):
     return (f"DRIVER=hid-generic\nHID_ID=0003:00003434:{pid}\n"
@@ -85,6 +85,12 @@ def azoth_uevent(node, pid="00001ACE", iface=1):
 def fake_open(path, mode="r", *a, **k):
     if path.startswith("/sys/class/hidraw"):
         node = path.split("/")[4]
+        if path.endswith("report_descriptor"):
+            scenario["descriptor_reads"] += 1
+            desc = scenario["descriptors"].get(node)
+            if desc is None:      # node present but its descriptor unreadable
+                raise OSError(5, "Input/output error")
+            return io.BytesIO(desc)
         return io.StringIO(scenario["uevents"][node])
     return builtins.open(path, mode, *a, **k)
 
@@ -140,6 +146,8 @@ def install_m5_scenario(pid="0000D028", name="Keychron Keychron Ultra-Link 8K", 
     scenario["reads"] = []
     scenario["read_sizes"] = []
     scenario["open_flags"] = []
+    scenario["descriptors"] = {}
+    scenario["descriptor_reads"] = 0
     scenario["reply_buf"] = bytearray(64)
     scenario["reply_queue"] = []
     scenario["reply_fd"] = 306
@@ -157,6 +165,8 @@ def install_sc2_scenario():
     scenario["reads"] = []
     scenario["read_sizes"] = []
     scenario["open_flags"] = []
+    scenario["descriptors"] = {}
+    scenario["descriptor_reads"] = 0
     scenario["reply_buf"] = bytearray(16)
     scenario["reply_queue"] = []
     scenario["reply_fd"] = 207
@@ -174,9 +184,68 @@ def install_azoth_scenario(pid="00001ACE", with_blocked=False):
     scenario["reads"] = []
     scenario["read_sizes"] = []
     scenario["open_flags"] = []
+    scenario["descriptors"] = {}
+    scenario["descriptor_reads"] = 0
     scenario["reply_buf"] = bytearray(65)
     scenario["reply_queue"] = []
     scenario["reply_fd"] = 309 if pid == "00001ACE" else 308
+
+# ── Synthetic vendor-usage-page device ──────────────────────────────────────
+# Stands in for the device families that put the battery collection on a vendor
+# page (Glorious mice and friends): which interface carries it cannot be told
+# from the interface number, so the report descriptor decides.
+_TEST_PID = 0xDEAD
+_TEST_VID = 0xBEEF
+
+def hid_descriptor(usage_page=0xFF01):
+    # minimal HID report descriptor declaring one usage page + a 2-byte usage
+    page_item = (bytes([0x05, usage_page]) if usage_page <= 0xFF
+                 else bytes([0x06, usage_page & 0xFF, (usage_page >> 8) & 0xFF]))
+    return page_item + bytes([0x0A, 0x02, 0x02]) + b"\xC0"
+
+def install_vendor_scenario(usage_page=0xFF01, iface=3, with_blocked=False):
+    scenario["uevents"] = {
+        "hidraw8": (f"DRIVER=hid-generic\nHID_ID=0003:{_TEST_VID:08X}:{_TEST_PID:08X}\n"
+                    f"HID_NAME=Test Vendor Mouse\n"
+                    f"HID_PHYS=usb-0000:00:14.0-11/input{iface}\nHID_UNIQ=\n"),
+    }
+    scenario["fake_devs"] = {"/dev/hidraw8": 208}
+    scenario["deny"] = with_blocked
+    scenario["writes"] = []
+    scenario["write_data"] = []
+    scenario["reads"] = []
+    scenario["read_sizes"] = []
+    scenario["open_flags"] = []
+    scenario["descriptors"] = ({"hidraw8": hid_descriptor(usage_page)}
+                               if usage_page is not None else {})
+    scenario["descriptor_reads"] = 0
+    scenario["reply_buf"] = bytearray(16)
+    scenario["reply_queue"] = []
+    scenario["reply_fd"] = 208
+
+@contextlib.contextmanager
+def vendor_device(usage_page=rhd.VENDOR_USAGE_PAGE, pid=_TEST_PID, vid=_TEST_VID):
+    """Registers a throwaway device whose node is selected by usage page."""
+    dev = rhd.Device(
+        name="Test Vendor Mouse",
+        device_type=rhd.DeviceType.MOUSE,
+        vid=vid,
+        variants=(rhd.DeviceVariant(pid, None, usage_page),),
+        source=rhd.InputStreamSchema(
+            charge=rhd.DataPos(0x43, 2),
+            charge_range=None,
+            status=rhd.ChargingStates(pos=rhd.DataPos(0x43, 1), states={0x01: False, 0x02: True}),
+        ),
+        parse=None,
+    )
+    rhd.KNOWN_DEVICES.append(dev)
+    # _USAGE_PAGE_PIDS is derived from the registry, so refresh it for the test
+    rhd._USAGE_PAGE_PIDS.add(pid)
+    try:
+        yield dev
+    finally:
+        rhd.KNOWN_DEVICES.remove(dev)
+        rhd._USAGE_PAGE_PIDS.discard(pid)
 
 def set_m5_reply(byte20=87, report_id=0xB4, cmd=0x06):
     buf = bytearray(64)
@@ -555,6 +624,8 @@ def test_is_blocked_uses_effective_variant_schema_open_mode():
     assert scenario["open_flags"] == [os.O_RDWR | os.O_NONBLOCK]
 
     scenario["open_flags"] = []
+    scenario["descriptors"] = {}
+    scenario["descriptor_reads"] = 0
     stream_variant = rhd.FoundDevice(m5.devpath, m5.serial, request_device, m5.pid, stream_device.source)
     assert rhd.is_blocked(stream_variant) is False
     assert scenario["open_flags"] == [os.O_RDONLY | os.O_NONBLOCK]
@@ -652,6 +723,123 @@ def test_simulate_both_report_after_both_rules():
             {"name": "Keychron M5", "serial": "sim-keychron-m5", "percentage": 88, "charging": False, "deviceType": "mouse"},
             {"name": "Steam Controller 2", "serial": "sim-steam-controller-2", "percentage": 85, "charging": True, "deviceType": "gamepad"},
         ]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Report-descriptor usage pages: selecting the battery node among a device's
+# interfaces when the interface number cannot say which one carries it
+# ══════════════════════════════════════════════════════════════════════════
+def test_parse_usage_pages_detects_vendor_page():
+    assert rhd._parse_usage_pages(bytes([0x06, 0x43, 0xFF, 0x0A, 0x02, 0x02]) + b"\xC0") == {0xFF43}
+
+def test_parse_usage_pages_skips_long_items():
+    # 0xFE = long item: next byte is the payload length, which must not be
+    # decoded as items or it would fabricate usage pages
+    data = bytes([0xFE, 0x03, 0x06, 0x43, 0xFF,
+                  0x06, 0x01, 0xFF, 0x0A, 0x02, 0x02])
+    assert rhd._parse_usage_pages(data) == {0xFF01}
+
+def test_parse_usage_pages_tolerates_garbage():
+    assert rhd._parse_usage_pages(b"") == set()
+    assert rhd._parse_usage_pages(b"\xFF\xFF\xFF\xFF") == set()  # truncated items
+
+def test_parse_usage_pages_realistic_mouse_descriptor():
+    # 4 collections (generic desktop, buttons+LEDs, consumer, vendor) in one
+    # node; the flat set is what the page test needs, so every page comes back
+    data = (bytes([0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0xC0])
+            + bytes([0x05, 0x09, 0x19, 0x01, 0x29, 0x02, 0x15, 0x00, 0x25, 0x01,
+                     0x75, 0x01, 0x95, 0x02, 0x05, 0x08, 0x19, 0x01, 0x29, 0x02,
+                     0x09, 0x01, 0x81, 0x02, 0x75, 0x01, 0x95, 0x02, 0x81, 0x01,
+                     0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0xC0])
+            + bytes([0x06, 0x00, 0xFF, 0x09, 0x02, 0x15, 0x00, 0x25, 0x01,
+                     0x75, 0x01, 0x95, 0x01, 0x81, 0x02, 0x75, 0x01, 0x95, 0x01,
+                     0x81, 0x01, 0xC0]))
+    assert rhd._parse_usage_pages(data) == {0x01, 0x08, 0x09, 0x0C, 0xFF00}
+
+def test_parse_usage_pages_two_byte_usage_keeps_the_current_page():
+    # a 2-byte Usage is a usage ID within the current page, NOT a page number
+    # in its high byte: 0x0A 0x02 0x02 under page 0xff43 stays on 0xff43
+    data = bytes([0x06, 0x43, 0xFF, 0x0A, 0x02, 0x02])
+    assert rhd._parse_usage_pages(data) == {0xFF43}, "no fabricated 0x02 page"
+
+def test_match_device_selects_node_by_usage_page_not_iface():
+    with vendor_device(0xFF01):
+        assert rhd.match_device(_TEST_VID, _TEST_PID, 3, {0xFF01}) is not None
+        assert rhd.match_device(_TEST_VID, _TEST_PID, 0, {0xFF01}) is not None, "iface irrelevant"
+        # right PID, wrong descriptor: not the battery node
+        assert rhd.match_device(_TEST_VID, _TEST_PID, 3, {0x0C}) is None
+        # no descriptor read at all
+        assert rhd.match_device(_TEST_VID, _TEST_PID, 3, set()) is None
+
+def test_match_device_vendor_sentinel_accepts_any_vendor_page():
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        for page in (0xFF00, 0xFF01, 0xFF43, 0xFFFF):
+            assert rhd.match_device(_TEST_VID, _TEST_PID, 3, {page}) is not None, hex(page)
+        for page in (0x0C, 0x01, 0xFF, 0xFEFF):
+            assert rhd.match_device(_TEST_VID, _TEST_PID, 3, {page}) is None, hex(page)
+
+def test_match_device_vendor_sentinel_never_matches_an_unregistered_device():
+    # 0xff00 is declared by plenty of non-vendor gear (Razer mice, Microsoft
+    # keyboards); the sentinel must stay gated behind a vid/pid match
+    assert rhd.match_device(0x1532, 0x005C, 0, {0xFF00}) is None
+    assert rhd.match_device(0x045E, 0x00DB, 0, {0xFF00}) is None
+
+def test_discovery_reads_descriptor_and_selects_vendor_node():
+    install_vendor_scenario(usage_page=0xFF01)
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        devs = rhd.find_devices()
+    assert [d.devpath for d in devs] == ["/dev/hidraw8"], [d.devpath for d in devs]
+    assert scenario["descriptor_reads"] == 1, scenario["descriptor_reads"]
+
+def test_discovery_rejects_node_without_a_vendor_page():
+    install_vendor_scenario(usage_page=0x0C)  # consumer-control collection only
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        assert rhd.find_devices() == []
+
+def test_discovery_unreadable_descriptor_matches_nothing():
+    # descriptor present in sysfs but unreadable -> skip, never mis-select
+    install_vendor_scenario(usage_page=None)
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        assert rhd.find_devices() == []
+    assert scenario["descriptor_reads"] == 1, scenario["descriptor_reads"]
+
+def test_discovery_picks_battery_node_among_multiple_interfaces():
+    # one physical device, two hidraw nodes: only the vendor-page one is the
+    # battery collection, so the interface number must not decide
+    def uevent(node, iface):
+        return (f"DRIVER=hid-generic\nHID_ID=0003:{_TEST_VID:08X}:{_TEST_PID:08X}\n"
+                f"HID_NAME=Test Vendor Mouse\n"
+                f"HID_PHYS=usb-0000:00:14.0-11/input{iface}\nHID_UNIQ=\n")
+    scenario["uevents"] = {"hidraw8": uevent("hidraw8", 3), "hidraw9": uevent("hidraw9", 4)}
+    scenario["fake_devs"] = {"/dev/hidraw8": 308, "/dev/hidraw9": 309}
+    scenario["deny"] = False
+    scenario["writes"] = []
+    scenario["write_data"] = []
+    scenario["reads"] = []
+    scenario["read_sizes"] = []
+    scenario["open_flags"] = []
+    scenario["reply_buf"] = bytearray(16)
+    scenario["reply_queue"] = []
+    scenario["reply_fd"] = 308
+    scenario["descriptors"] = {"hidraw8": hid_descriptor(0xFF01),   # vendor: the battery node
+                               "hidraw9": hid_descriptor(0x0C)}     # consumer: not a battery
+    scenario["descriptor_reads"] = 0
+
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        devs = rhd.find_devices()
+    # one entry per physical device, and it is the vendor node (iface 3)
+    assert [d.devpath for d in devs] == ["/dev/hidraw8"], [d.devpath for d in devs]
+    assert scenario["descriptor_reads"] == 2, "one descriptor read per candidate node"
+
+def test_descriptor_read_only_for_usage_page_pids():
+    # descriptors are only read for PIDs with a usage_page variant
+    install_m5_scenario()                     # iface-only device
+    rhd.find_devices()
+    assert scenario["descriptor_reads"] == 0, f"M5 must not read descriptors: {scenario['descriptor_reads']}"
+    install_vendor_scenario()                 # usage-page device
+    with vendor_device(rhd.VENDOR_USAGE_PAGE):
+        rhd.find_devices()
+    assert scenario["descriptor_reads"] == 1, f"vendor device reads exactly one: {scenario['descriptor_reads']}"
 
 
 # ══════════════════════════════════════════════════════════════════════════
