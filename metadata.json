@@ -2,6 +2,10 @@
     "KPlugin": {
         "Authors": [
             {
+                "Name": "Itay Avra",
+                "Name[hu]": "Itay Avraham",
+                "Name[pl]": "Itay Avraham",
+                "Name[he]": "Itay Avraham",
                 "Email": "itay.avra@gmail.com",
                 "Email[hu]": "itay.avra@gmail.com",
                 "Email[pl]": "itay.avra@gmail.com",

@@ -6,6 +6,7 @@ import org.kde.plasma.core as PlasmaCore
 import org.kde.kirigami 2.20 as Kirigami
 import org.kde.plasma.plasma5support 2.0 as P5Support
 import "providers"
+import "DeviceUtils.js" as DeviceUtils
 
 PlasmoidItem {
     id: root
@@ -38,8 +39,18 @@ PlasmoidItem {
         id: hidDevicesProvider
     }
 
-    // List of providers (in priority order)
-    property var providers: [upowerProvider, companionProvider, openLinkHubProvider, openRazerProvider, kdeConnectProvider, hidDevicesProvider]
+    SolaarProvider {
+        id: solaarProvider
+    }
+
+    // List of providers (in priority order). 
+    // Vendor-specific sources come first, since each talks to its own devices 
+    // with maintained per-model knowledge
+    // The HID helper is the last-resort direct reader.
+    // UPower is last because it is the general API and should be the catch-all.
+    // The HID helper is the last-resort direct reader.
+    // UPower is last because it is the general API and should be the catch-all.
+    property var providers: [companionProvider, openLinkHubProvider, openRazerProvider, kdeConnectProvider, solaarProvider, hidDevicesProvider, upowerProvider]
 
     // Debug mode
     property bool debugMode: Plasmoid.configuration.debugMode
@@ -58,7 +69,7 @@ PlasmoidItem {
     property int visibleDeviceCount: {
         var count = 0;
         for (var i = 0; i < allDevices.length; i++) {
-            if (hiddenDevices.indexOf(allDevices[i].serial) === -1) {
+            if (hiddenDevices.indexOf(DeviceUtils.deviceIdentity(allDevices[i])) === -1) {
                 count++;
             }
         }
@@ -107,7 +118,7 @@ PlasmoidItem {
         var items = [];
         for (var i = 0; i < devices.length; i++) {
             var device = devices[i];
-            if (hidden.indexOf(device.serial) !== -1)
+            if (hidden.indexOf(DeviceUtils.deviceIdentity(device)) !== -1)
                 continue;
 
             // Devices whose battery needs a permission we don't have yet: keep
@@ -160,7 +171,7 @@ PlasmoidItem {
 
             for (var i = 0; i < devices.length; i++) {
                 var device = devices[i];
-                var id = device.serial || device.objectPath || "";
+                var id = DeviceUtils.deviceIdentity(device);
 
                 if (id && !seenIds[id]) {
                     merged.push(device);
@@ -196,7 +207,7 @@ PlasmoidItem {
         var lines = [];
         for (var i = 0; i < allDevices.length; i++) {
             var device = allDevices[i];
-            if (hiddenDevices.indexOf(device.serial) !== -1)
+            if (hiddenDevices.indexOf(DeviceUtils.deviceIdentity(device)) !== -1)
                 continue;
             var line = device.name;
 
@@ -266,7 +277,8 @@ PlasmoidItem {
     function loadHiddenDevices() {
         var saved = Plasmoid.configuration.hiddenDevices;
         if (saved) {
-            hiddenDevices = saved.split(",").filter(s => s.length > 0);
+            hiddenDevices = saved.split(",").filter(s => s.length > 0)
+                .map(s => DeviceUtils.canonicalSerial(s));
         } else {
             hiddenDevices = [];
         }
@@ -276,10 +288,11 @@ PlasmoidItem {
         Plasmoid.configuration.hiddenDevices = hiddenDevices.join(i18n(", "));
     }
 
-    function toggleDeviceVisibility(serial) {
-        var index = hiddenDevices.indexOf(serial);
+    function toggleDeviceVisibility(device) {
+        var id = DeviceUtils.deviceIdentity(device);
+        var index = hiddenDevices.indexOf(id);
         if (index === -1) {
-            hiddenDevices.push(serial);
+            hiddenDevices.push(id);
         } else {
             hiddenDevices.splice(index, 1);
         }
@@ -560,13 +573,13 @@ PlasmoidItem {
 
                                         PlasmaComponents.ToolButton {
                                             visible: device.blocked !== true
-                                            icon.name: root.hiddenDevices.indexOf(device.serial) === -1 ? "view-visible" : "view-hidden"
-                                            text: root.hiddenDevices.indexOf(device.serial) === -1 ? i18n("Hide") : i18n("Show")
+                                            icon.name: root.hiddenDevices.indexOf(DeviceUtils.deviceIdentity(device)) === -1 ? "view-visible" : "view-hidden"
+                                            text: root.hiddenDevices.indexOf(DeviceUtils.deviceIdentity(device)) === -1 ? i18n("Hide") : i18n("Show")
                                             display: PlasmaComponents.AbstractButton.IconOnly
-                                            onClicked: toggleDeviceVisibility(device.serial)
+                                            onClicked: toggleDeviceVisibility(device)
 
                                             PlasmaComponents.ToolTip {
-                                                text: root.hiddenDevices.indexOf(device.serial) === -1 ? i18n("Hide from tray") : i18n("Show in tray")
+                                                text: root.hiddenDevices.indexOf(DeviceUtils.deviceIdentity(device)) === -1 ? i18n("Hide from tray") : i18n("Show in tray")
                                             }
 
                                             MouseArea {
